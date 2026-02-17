@@ -1,0 +1,99 @@
+import math
+import numpy as np
+from typing import List, Tuple, Dict, Any
+
+def sort_points_counterclockwise_from_top(points: List[Tuple[float, float]], 
+                                         center: Tuple[float, float]) -> List[Dict[str, Any]]:
+    """
+    Sort points by angle counterclockwise starting from 90° (top) and going to 270°.
+    
+    Args:
+        points: List of (x, y) coordinates
+        center: (cx, cy) center of the circle
+    
+    Returns:
+        List of dictionaries with point info and sorted indices
+    """
+    cx, cy = center
+    points_with_angles = []
+    
+    for i, (x, y) in enumerate(points):
+        # Calculate vector from center
+        dx = x - cx
+        dy = y - cy
+        
+        # Calculate raw angle using atan2 (returns -π to π)
+        raw_angle = math.atan2(dy, dx)
+        
+        # Convert to degrees
+        angle_deg = math.degrees(raw_angle)
+        
+        # Transform angle to start from 90° going counterclockwise
+        # atan2: 0° = right (3 o'clock), 90° = up (12 o'clock)
+        # We want: 90° = start (top), increasing counterclockwise to 450° (which wraps to 90°)
+        
+        # Shift angle so 0° is at the top (90° in original coordinates)
+        # Subtract 90° and ensure positive angle
+        shifted_angle = (angle_deg - 90) % 360
+        
+        # For counterclockwise starting at top, we want angles increasing from 0 to 360
+        # but since we go from 90° to 270° counterclockwise, we need to handle the wrap
+        if shifted_angle < 0:
+            shifted_angle += 360
+        
+        # For points from 270° to 360° (left side to top, going through bottom),
+        # we want them to be ordered after points from 0° to 180°
+        # This creates the proper counterclockwise ordering from top through right side
+        if angle_deg >= -90 and angle_deg <= 90:
+            # Points on the right side (through top) - give them higher priority
+            sort_angle = shifted_angle
+        else:
+            # Points on the left side - offset to come after right side
+            sort_angle = shifted_angle + 360
+        
+        points_with_angles.append({
+            'index': i,
+            'coordinates': (x, y),
+            'raw_angle': angle_deg,
+            'sort_angle': sort_angle
+        })
+    
+    # Sort by the adjusted angle
+    sorted_points = sorted(points_with_angles, key=lambda p: p['sort_angle'])
+    
+    return sorted_points
+
+def print_sorted_points(sorted_points: List[Dict[str, Any]]):
+    """Print the sorted points in a readable format."""
+    print("Points sorted counterclockwise from top (90°) to 270°:")
+    print("-" * 50)
+    for i, point in enumerate(sorted_points):
+        print(f"{i:2d}. Point {point['index']:2d}: ({point['coordinates'][0]:6.2f}, "
+              f"{point['coordinates'][1]:6.2f}) - angle: {point['raw_angle']:6.2f}°")
+
+# Example usage
+if __name__ == "__main__":
+    # Example center
+    center = (0, 0)
+    
+    # Example points around the circle (in random order)
+    points = [
+        (1, 0),      # 0° (right)
+        (0, 1),      # 90° (top)
+        (-1, 0),     # 180° (left)
+        (0, -1),     # 270° (bottom)
+        (0.707, 0.707),   # 45°
+        (-0.707, 0.707),  # 135°
+        (-0.707, -0.707), # 225°
+        (0.707, -0.707),  # 315°
+    ]
+    
+    # Sort the points
+    sorted_points = sort_points_counterclockwise_from_top(points, center)
+    
+    # Print results
+    print_sorted_points(sorted_points)
+    
+    # Extract just the indices if needed
+    sorted_indices = [p['index'] for p in sorted_points]
+    print(f"\nSorted indices: {sorted_indices}")
