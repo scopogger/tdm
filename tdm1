@@ -1,99 +1,184 @@
-import math
-import numpy as np
-from typing import List, Tuple, Dict, Any
+import sys
+import fitz  # PyMuPDF
+from PySide6.QtWidgets import (
+QApplication, QMainWindow, QPushButton, QFileDialog, QMessageBox
+)
+from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+from PySide6.QtGui import QPainter, QImage, QPageLayout, QPageSize, QTransform
+from PySide6.QtCore import QMarginsF, QRectF
 
-def sort_points_counterclockwise_from_top(points: List[Tuple[float, float]], 
-                                         center: Tuple[float, float]) -> List[Dict[str, Any]]:
+def parse_user_page_ranges(input_str, total_pages):
+“””
+Парсит строку вида “1,3,5-7” в список 0-based индексов страниц.
+Пример: “1,3,5-7” → [0, 2, 4, 5, 6]
+“””
+pages = set()
+parts = [p.strip() for p in input_str.split(”,”) if p.strip()]
+for part in parts:
+if “-” in part:
+try:
+start, end = part.split(”-”)
+start = max(1, int(start))
+end = min(total_pages, int(end))
+pages.update(range(start - 1, end))
+except (ValueError, TypeError):
+continue
+else:
+try:
+p = int(part)
+if 1 <= p <= total_pages:
+pages.add(p - 1)
+except (ValueError, TypeError):
+continue
+return sorted(pages)
+
+class PDFPrinter:
+mm_per_inch = 25.4
+points_per_inch = 72.0
+
+```
+def __init__(self, main_window, doc):
+    self.main_window = main_window
+    self.print_pdf_with_settings(doc)
+
+def print_pdf_with_settings(self, doc):
+    total_pages = len(doc)
+    if total_pages == 0:
+        QMessageBox.warning(self.main_window, "Пустой PDF", "Файл не содержит страниц.")
+        return
+
+    # Создаём принтер
+    printer = QPrinter(QPrinter.HighResolution)
+    printer.setFromTo(1, total_pages)
+
+    # Настройки печати
+    print_dialog = QPrintDialog(printer, self.main_window)
+    print_dialog.setWindowTitle("Печать документа")
+
+    # Включаем нужные опции
+    print_dialog.setOption(QPrintDialog.PrintPageRange, True)
+    print_dialog.setOption(QPrintDialog.PrintCollateCopies, True)
+    print_dialog.setOption(QPrintDialog.PrintShowPageSize, True)
+    print_dialog.setOption(QPrintDialog.PrintToFile, True)
+    if print_dialog.exec() != QPrintDialog.Accepted:
+        return
+
+    # Получаем настройки
+    mode = printer.printRange()
+    printer_name = printer.printerName()
+    copies = printer.copyCount()
+    collate = printer.collateCopies()
+
+    # Получаем список страниц
+    pages_to_print = self._extract_pages_from_printer(printer, total_pages, mode)
+    if not pages_to_print:
+        QMessageBox.information(self.main_window, "Нет страниц", "Диапазон страниц пуст.")
+        return
+
+    # --- KEY FIX ---
+    # Use paintRect (the actual printable area) not fullRect.
+    # paintRect is in device pixels and already excludes hardware margins.
+    # Do NOT divide by printer.resolution() — paintRect is already in pixels.
+    layout = printer.pageLayout()
+
+    # paintRectPixels gives the printable rect in device pixels
+    paint_rect_px = printer.pageLayout().paintRectPixels(printer.resolution())
+    paper_w_px = paint_rect_px.width()
+    paper_h_px = paint_rect_px.height()
+
+    # Render at the printer's native DPI for best quality (cap at 300 to
+    # avoid huge memory use on 1200-dpi printers)
+    render_dpi = min(printer.resolution(), 300)
+
+    # 5. Печать
+    painter = QPainter(printer)
+    try:
+        for idx, page_num in enumerate(pages_to_print):
+            page = doc.load_page(page_num)
+            rect = page.rect
+            is_landscape = rect.width > rect.height
+
+            # Рендерим с нужным DPI
+            scale = render_dpi / self.points_per_inch
+            mat = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=mat)
+            qimg = QImage.fromData(pix.tobytes("png"), "png")
+            if qimg.isNull():
+                raise RuntimeError(f"Не удалось создать QImage для страницы {page_num + 1}")
+
+            # Поворот для альбомных страниц
+            if is_landscape:
+                transform = QTransform().rotate(90)
+                qimg = qimg.transformed(transform)
+
+            # Размеры изображения после поворота
+            img_w = qimg.width()
+            img_h = qimg.height()
+
+            # Масштабируем под лист (без переполнения), сохраняя пропорции
+            if img_w and img_h:
+                scale_factor = min(paper_w_px / img_w, paper_h_px / img_h)
+            else:
+                scale_factor = 1.0
+
+            scale_w = img_w * scale_factor
+            scale_h = img_h * scale_factor
+
+            # Центрируем внутри printable area.
+            # Origin (0, 0) of the painter IS already the top-left of the
+            # paintable area — no need to add hardware margin offsets.
+            target_x = (paper_w_px - scale_w) / 2
+            target_y = (paper_h_px - scale_h) / 2
+            target_rect = QRectF(target_x, target_y, scale_w, scale_h)
+
+            painter.drawImage(target_rect, qimg)
+
+            if idx < len(pages_to_print) - 1:
+                printer.newPage()
+
+    except Exception as e:
+        painter.end()
+        QMessageBox.critical(self.main_window, "Ошибка печати", f"Произошла ошибка:\n{e}")
+        return
+
+    painter.end()
+
+    msg = (
+        f"Печать завершена!\n"
+        f"Принтер: {printer_name or 'По умолчанию'}\n"
+        f"Страниц: {len(pages_to_print)} из {total_pages}\n"
+        f"Копий: {copies}, Коллация: {'Да' if collate else 'Нет'}"
+    )
+    QMessageBox.information(self.main_window, "Успех", msg)
+
+def _extract_pages_from_printer(self, printer, total_pages, mode):
     """
-    Sort points by angle counterclockwise starting from 90° (top) and going to 270°.
-    
-    Args:
-        points: List of (x, y) coordinates
-        center: (cx, cy) center of the circle
-    
-    Returns:
-        List of dictionaries with point info and sorted indices
+    Извлекает список страниц из QPrinter в зависимости от printRange().
     """
-    cx, cy = center
-    points_with_angles = []
-    
-    for i, (x, y) in enumerate(points):
-        # Calculate vector from center
-        dx = x - cx
-        dy = y - cy
-        
-        # Calculate raw angle using atan2 (returns -π to π)
-        raw_angle = math.atan2(dy, dx)
-        
-        # Convert to degrees
-        angle_deg = math.degrees(raw_angle)
-        
-        # Transform angle to start from 90° going counterclockwise
-        # atan2: 0° = right (3 o'clock), 90° = up (12 o'clock)
-        # We want: 90° = start (top), increasing counterclockwise to 450° (which wraps to 90°)
-        
-        # Shift angle so 0° is at the top (90° in original coordinates)
-        # Subtract 90° and ensure positive angle
-        shifted_angle = (angle_deg - 90) % 360
-        
-        # For counterclockwise starting at top, we want angles increasing from 0 to 360
-        # but since we go from 90° to 270° counterclockwise, we need to handle the wrap
-        if shifted_angle < 0:
-            shifted_angle += 360
-        
-        # For points from 270° to 360° (left side to top, going through bottom),
-        # we want them to be ordered after points from 0° to 180°
-        # This creates the proper counterclockwise ordering from top through right side
-        if angle_deg >= -90 and angle_deg <= 90:
-            # Points on the right side (through top) - give them higher priority
-            sort_angle = shifted_angle
-        else:
-            # Points on the left side - offset to come after right side
-            sort_angle = shifted_angle + 360
-        
-        points_with_angles.append({
-            'index': i,
-            'coordinates': (x, y),
-            'raw_angle': angle_deg,
-            'sort_angle': sort_angle
-        })
-    
-    # Sort by the adjusted angle
-    sorted_points = sorted(points_with_angles, key=lambda p: p['sort_angle'])
-    
-    return sorted_points
+    pages = []
 
-def print_sorted_points(sorted_points: List[Dict[str, Any]]):
-    """Print the sorted points in a readable format."""
-    print("Points sorted counterclockwise from top (90°) to 270°:")
-    print("-" * 50)
-    for i, point in enumerate(sorted_points):
-        print(f"{i:2d}. Point {point['index']:2d}: ({point['coordinates'][0]:6.2f}, "
-              f"{point['coordinates'][1]:6.2f}) - angle: {point['raw_angle']:6.2f}°")
+    if mode == QPrinter.PrintRange.PageRange:
+        from_page = printer.fromPage()
+        to_page = printer.toPage()
+        if from_page <= 0:
+            from_page = 1
+        if to_page > total_pages:
+            to_page = total_pages
+        pages = list(range(from_page - 1, to_page))
 
-# Example usage
-if __name__ == "__main__":
-    # Example center
-    center = (0, 0)
-    
-    # Example points around the circle (in random order)
-    points = [
-        (1, 0),      # 0° (right)
-        (0, 1),      # 90° (top)
-        (-1, 0),     # 180° (left)
-        (0, -1),     # 270° (bottom)
-        (0.707, 0.707),   # 45°
-        (-0.707, 0.707),  # 135°
-        (-0.707, -0.707), # 225°
-        (0.707, -0.707),  # 315°
-    ]
-    
-    # Sort the points
-    sorted_points = sort_points_counterclockwise_from_top(points, center)
-    
-    # Print results
-    print_sorted_points(sorted_points)
-    
-    # Extract just the indices if needed
-    sorted_indices = [p['index'] for p in sorted_points]
-    print(f"\nSorted indices: {sorted_indices}")
+    elif mode == QPrinter.PrintRange.AllPages:
+        pages = list(range(total_pages))
+
+    elif mode == QPrinter.PrintRange.CurrentPage:
+        # Qt6 нет CurrentPage — оставим как fallback
+        pages = [0]
+
+    # Уникальные, отсортированные, валидные
+    return sorted({p for p in pages if 0 <= p < total_pages})
+
+def render_page_with_correct_scale(self, page, target_dpi):
+    scale = target_dpi / 72.0   # 1 point = 1/72 inch → *scale = пиксели
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat)
+    return pix
+```
