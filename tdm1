@@ -1,184 +1,220 @@
-import sys
-import fitz  # PyMuPDF
-from PySide6.QtWidgets import (
-QApplication, QMainWindow, QPushButton, QFileDialog, QMessageBox
-)
-from PySide6.QtPrintSupport import QPrinter, QPrintDialog
-from PySide6.QtGui import QPainter, QImage, QPageLayout, QPageSize, QTransform
-from PySide6.QtCore import QMarginsF, QRectF
-
-def parse_user_page_ranges(input_str, total_pages):
-“””
-Парсит строку вида “1,3,5-7” в список 0-based индексов страниц.
-Пример: “1,3,5-7” → [0, 2, 4, 5, 6]
-“””
-pages = set()
-parts = [p.strip() for p in input_str.split(”,”) if p.strip()]
-for part in parts:
-if “-” in part:
-try:
-start, end = part.split(”-”)
-start = max(1, int(start))
-end = min(total_pages, int(end))
-pages.update(range(start - 1, end))
-except (ValueError, TypeError):
-continue
-else:
-try:
-p = int(part)
-if 1 <= p <= total_pages:
-pages.add(p - 1)
-except (ValueError, TypeError):
-continue
-return sorted(pages)
-
-class PDFPrinter:
-mm_per_inch = 25.4
-points_per_inch = 72.0
-
-```
-def __init__(self, main_window, doc):
-    self.main_window = main_window
-    self.print_pdf_with_settings(doc)
-
-def print_pdf_with_settings(self, doc):
-    total_pages = len(doc)
-    if total_pages == 0:
-        QMessageBox.warning(self.main_window, "Пустой PDF", "Файл не содержит страниц.")
+def export_pages(self):
+    """Export selected pages as images or a PDF document"""
+    pv = getattr(self.ui, 'pdfView', None)
+    if not pv or not hasattr(pv, 'document') or pv.document is None:
+        QMessageBox.warning(self.main_window, "Нет документа", "Пожалуйста, сначала откройте PDF файл.")
         return
 
-    # Создаём принтер
-    printer = QPrinter(QPrinter.HighResolution)
-    printer.setFromTo(1, total_pages)
-
-    # Настройки печати
-    print_dialog = QPrintDialog(printer, self.main_window)
-    print_dialog.setWindowTitle("Печать документа")
-
-    # Включаем нужные опции
-    print_dialog.setOption(QPrintDialog.PrintPageRange, True)
-    print_dialog.setOption(QPrintDialog.PrintCollateCopies, True)
-    print_dialog.setOption(QPrintDialog.PrintShowPageSize, True)
-    print_dialog.setOption(QPrintDialog.PrintToFile, True)
-    if print_dialog.exec() != QPrintDialog.Accepted:
+    cur_doc = pv.document.current_doc
+    total_pages = cur_doc.page_count
+    if total_pages <= 0:
+        QMessageBox.warning(self.main_window, "Ошибка", "Не удалось определить количество страниц.")
         return
 
-    # Получаем настройки
-    mode = printer.printRange()
-    printer_name = printer.printerName()
-    copies = printer.copyCount()
-    collate = printer.collateCopies()
-
-    # Получаем список страниц
-    pages_to_print = self._extract_pages_from_printer(printer, total_pages, mode)
-    if not pages_to_print:
-        QMessageBox.information(self.main_window, "Нет страниц", "Диапазон страниц пуст.")
+    dialog = PagesRangeDialog(self.main_window, "EXPORT")
+    if dialog.exec() != QDialog.Accepted:
         return
 
-    # --- KEY FIX ---
-    # Use paintRect (the actual printable area) not fullRect.
-    # paintRect is in device pixels and already excludes hardware margins.
-    # Do NOT divide by printer.resolution() — paintRect is already in pixels.
-    layout = printer.pageLayout()
-
-    # paintRectPixels gives the printable rect in device pixels
-    paint_rect_px = printer.pageLayout().paintRectPixels(printer.resolution())
-    paper_w_px = paint_rect_px.width()
-    paper_h_px = paint_rect_px.height()
-
-    # Render at the printer's native DPI for best quality (cap at 300 to
-    # avoid huge memory use on 1200-dpi printers)
-    render_dpi = min(printer.resolution(), 300)
-
-    # 5. Печать
-    painter = QPainter(printer)
     try:
-        for idx, page_num in enumerate(pages_to_print):
-            page = doc.load_page(page_num)
-            rect = page.rect
-            is_landscape = rect.width > rect.height
+        pages_to_export = dialog.get_page_ranges()
+        if not pages_to_export:
+            return
+    except ValueError as e:
+        QMessageBox.warning(self.main_window, "Ошибка ввода", f"Некорректные данные: {e}")
+        return
 
-            # Рендерим с нужным DPI
-            scale = render_dpi / self.points_per_inch
-            mat = fitz.Matrix(scale, scale)
-            pix = page.get_pixmap(matrix=mat)
-            qimg = QImage.fromData(pix.tobytes("png"), "png")
-            if qimg.isNull():
-                raise RuntimeError(f"Не удалось создать QImage для страницы {page_num + 1}")
+    # --- Ask format: PDF or image ---
+    format_choice, ok = QInputDialog.getItem(
+        self.main_window,
+        "Формат экспорта",
+        "Выберите формат экспорта:",
+        ["PDF", "JPEG", "PNG", "BMP"],
+        0,
+        False
+    )
+    if not ok:
+        return
 
-            # Поворот для альбомных страниц
-            if is_landscape:
-                transform = QTransform().rotate(90)
-                qimg = qimg.transformed(transform)
+    # ── PDF export branch ──────────────────────────────────────────
+    if format_choice == "PDF":
+        last_dir = settings_manager.get_last_directory()
+        doc_basename = os.path.splitext(os.path.basename(
+            getattr(self.main_window, 'current_document_path', '') or 'document'
+        ))[0]
+        default_name = f"{doc_basename}_pages_export.pdf"
 
-            # Размеры изображения после поворота
-            img_w = qimg.width()
-            img_h = qimg.height()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.main_window,
+            "Сохранить страницы как PDF",
+            os.path.join(last_dir, default_name),
+            "PDF Files (*.pdf)"
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.pdf'):
+            file_path += '.pdf'
 
-            # Масштабируем под лист (без переполнения), сохраняя пропорции
-            if img_w and img_h:
-                scale_factor = min(paper_w_px / img_w, paper_h_px / img_h)
-            else:
-                scale_factor = 1.0
+        settings_manager.save_last_directory(os.path.dirname(file_path))
 
-            scale_w = img_w * scale_factor
-            scale_h = img_h * scale_factor
+        try:
+            new_doc = fitz.open()
+            for page_num in pages_to_export:
+                new_doc.insert_pdf(cur_doc, from_page=page_num, to_page=page_num)
+            new_doc.save(file_path)
+            new_doc.close()
 
-            # Центрируем внутри printable area.
-            # Origin (0, 0) of the painter IS already the top-left of the
-            # paintable area — no need to add hardware margin offsets.
-            target_x = (paper_w_px - scale_w) / 2
-            target_y = (paper_h_px - scale_h) / 2
-            target_rect = QRectF(target_x, target_y, scale_w, scale_h)
+            QMessageBox.information(
+                self.main_window,
+                "Успешно",
+                f"Экспортировано {len(pages_to_export)} стр. в файл:\n{os.path.basename(file_path)}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self.main_window,
+                "Ошибка",
+                f"Не удалось сохранить PDF:\n{str(e)}"
+            )
+        return
 
-            painter.drawImage(target_rect, qimg)
+    # ── Image export branch ────────────────────────────────────────
+    zoom_levels = {
+        "Среднее (72 DPI)": 1.0,
+        "Хорошее (150 DPI)": 2.0,
+        "Высокое (300 DPI)": 4.0,
+        "Очень высокое (600 DPI)": 8.0
+    }
 
-            if idx < len(pages_to_print) - 1:
-                printer.newPage()
+    quality, ok = QInputDialog.getItem(
+        self.main_window,
+        "Качество изображения",
+        "Выберите качество изображения:",
+        list(zoom_levels.keys()),
+        1,
+        False
+    )
+    if not ok:
+        return
+
+    zoom = zoom_levels[quality]
+
+    last_dir = settings_manager.get_last_directory()
+    doc_basename = os.path.splitext(os.path.basename(
+        getattr(self.main_window, 'current_document_path', '') or 'document'
+    ))[0]
+
+    if len(pages_to_export) > 1:
+        output_dir = QFileDialog.getExistingDirectory(
+            self.main_window,
+            "Выберите папку для сохранения изображений",
+            last_dir
+        )
+        if not output_dir:
+            return
+        settings_manager.save_last_directory(output_dir)
+        format_type = format_choice
+        format_ext = format_choice.lower()
+        quality_param = 95 if format_choice == "JPEG" else 100
+    else:
+        filter_map = {
+            "JPEG": "Изображения JPEG (*.jpg *.jpeg)",
+            "PNG":  "Изображения PNG (*.png)",
+            "BMP":  "Изображения BMP (*.bmp)",
+        }
+        default_name = f"{doc_basename}_p{pages_to_export[0] + 1}_{quality.replace(' ', '_').lower()}.{format_choice.lower()}"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.main_window,
+            f"Сохранить страницу как изображение ({quality})",
+            os.path.join(last_dir, default_name),
+            filter_map[format_choice]
+        )
+        if not file_path:
+            return
+        settings_manager.save_last_directory(os.path.dirname(file_path))
+        format_type = format_choice
+        format_ext = format_choice.lower()
+        quality_param = 95 if format_choice == "JPEG" else 100
+
+    try:
+        progress = QProgressDialog(
+            f"Экспорт {len(pages_to_export)} страниц...",
+            "Отмена",
+            0,
+            len(pages_to_export),
+            self.main_window
+        )
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        QApplication.processEvents()
+
+        successful = 0
+        failed = []
+
+        for idx, page_num in enumerate(pages_to_export):
+            progress.setValue(idx)
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                break
+
+            try:
+                page = pv.document.get_page(page_num)
+                rotation = pv.page_rotations.get(page_num, 0)
+                if rotation != 0:
+                    page.set_rotation(rotation)
+
+                matrix = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=matrix, alpha=False, colorspace=fitz.csRGB)
+                img_data = pix.tobytes("ppm")
+                image = QImage()
+                image.loadFromData(img_data)
+
+                if image.isNull():
+                    raise Exception("Не удалось преобразовать страницу в изображение.")
+
+                if len(pages_to_export) > 1:
+                    filename = f"{doc_basename}_p{page_num + 1}.{format_ext}"
+                    path = os.path.join(output_dir, filename)
+                else:
+                    path = file_path
+
+                success = image.save(path, format_type, quality_param)
+                if success:
+                    successful += 1
+                else:
+                    failed.append(page_num + 1)
+
+            except Exception as e:
+                failed.append(page_num + 1)
+
+        progress.close()
+
+        if failed:
+            QMessageBox.information(
+                self.main_window,
+                "Экспорт завершён с ошибками",
+                f"Успешно сохранено: {successful}\nОшибки на страницах: {', '.join(map(str, failed))}"
+            )
+        elif len(pages_to_export) > 1:
+            QMessageBox.information(
+                self.main_window,
+                "Успешно",
+                f"Все {successful} страниц сохранены в папке:\n{output_dir}"
+            )
+        else:
+            QMessageBox.information(
+                self.main_window,
+                "Успешно",
+                f"Страница {pages_to_export[0] + 1} сохранена в качестве '{quality}'\n"
+                f"Файл: {os.path.basename(file_path)}\n"
+                f"Размер: {image.width()} x {image.height()} пикселей"
+            )
 
     except Exception as e:
-        painter.end()
-        QMessageBox.critical(self.main_window, "Ошибка печати", f"Произошла ошибка:\n{e}")
-        return
-
-    painter.end()
-
-    msg = (
-        f"Печать завершена!\n"
-        f"Принтер: {printer_name or 'По умолчанию'}\n"
-        f"Страниц: {len(pages_to_print)} из {total_pages}\n"
-        f"Копий: {copies}, Коллация: {'Да' if collate else 'Нет'}"
-    )
-    QMessageBox.information(self.main_window, "Успех", msg)
-
-def _extract_pages_from_printer(self, printer, total_pages, mode):
-    """
-    Извлекает список страниц из QPrinter в зависимости от printRange().
-    """
-    pages = []
-
-    if mode == QPrinter.PrintRange.PageRange:
-        from_page = printer.fromPage()
-        to_page = printer.toPage()
-        if from_page <= 0:
-            from_page = 1
-        if to_page > total_pages:
-            to_page = total_pages
-        pages = list(range(from_page - 1, to_page))
-
-    elif mode == QPrinter.PrintRange.AllPages:
-        pages = list(range(total_pages))
-
-    elif mode == QPrinter.PrintRange.CurrentPage:
-        # Qt6 нет CurrentPage — оставим как fallback
-        pages = [0]
-
-    # Уникальные, отсортированные, валидные
-    return sorted({p for p in pages if 0 <= p < total_pages})
-
-def render_page_with_correct_scale(self, page, target_dpi):
-    scale = target_dpi / 72.0   # 1 point = 1/72 inch → *scale = пиксели
-    mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat)
-    return pix
-```
+        try:
+            progress.close()
+        except:
+            pass
+        QMessageBox.critical(
+            self.main_window,
+            "Ошибка",
+            f"Не удалось сохранить страницы как изображения:\n{str(e)}"
+        )
