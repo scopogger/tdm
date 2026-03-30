@@ -1,199 +1,145 @@
 “””
-sender.py  —  Run this on the air-gapped Windows PC.
+receiver.py  —  Run this on YOUR computer (Mac / Windows / Linux).
 
-Usage:
-python sender.py                    # scans current directory
-python sender.py C:/path/to/project # scans a specific folder
+How to feed it the scanned data — pick whichever is easiest:
 
-Controls in the QR window:
-Space / Left-click  →  next QR code
-Backspace           →  previous QR code
-Escape              →  quit
+Option A — Paste chunks manually (recommended for small counts):
+python receiver.py
+Then paste each scanned QR string one by one and press Enter.
+Type ‘done’ when finished. Order doesn’t matter.
 
-Requirements (already on the PC):
-- PySide6
-- qrcode  (any version ≥ 1.0.0)
-- Pillow  (very likely installed; if not, falls back to pypng/svg)
+Option B — Feed a text file (one chunk per line):
+python receiver.py chunks.txt
+
+Option C — Feed a CSV exported from the scanner app:
+python receiver.py export.csv
+(The script auto-detects CSV and reads every cell that looks like a chunk.)
+
+Output:
+Files are written into  ./received/  preserving the original folder structure.
+
+Requirements:
+Python 3.6+ standard library only — no extra packages needed.
 “””
 
 import sys
 import os
 import json
 import base64
-import math
+import csv
+import re
 
-# ── Collect files ──────────────────────────────────────────────────────────────
+CHUNK_RE = re.compile(r’^(\d+)/(\d+):(.+)$’)
 
-def collect_files(root: str) -> list[dict]:
-“”“Walk root folder and return list of {rel_path, b64_content} dicts.”””
-entries = []
-root = os.path.abspath(root)
-for dirpath, dirnames, filenames in os.walk(root):
-# Skip hidden / cache dirs
-dirnames[:] = [d for d in dirnames if not d.startswith(’.’) and d != ‘**pycache**’]
-for fname in filenames:
-fpath = os.path.join(dirpath, fname)
-rel   = os.path.relpath(fpath, root).replace(’\’, ‘/’)
+OUT_DIR = ‘received’
+
+def parse_chunk(text: str):
+“”“Parse ‘INDEX/TOTAL:payload’ → (index, total, payload) or None.”””
+text = text.strip()
+m = CHUNK_RE.match(text)
+if not m:
+return None
+return int(m.group(1)), int(m.group(2)), m.group(3)
+
+def collect_from_file(path: str) -> list[str]:
+lines = []
+if path.lower().endswith(’.csv’):
+with open(path, newline=’’, encoding=‘utf-8’) as f:
+for row in csv.reader(f):
+for cell in row:
+if CHUNK_RE.match(cell.strip()):
+lines.append(cell.strip())
+else:
+with open(path, encoding=‘utf-8’) as f:
+for line in f:
+line = line.strip()
+if line:
+lines.append(line)
+return lines
+
+def collect_interactive() -> list[str]:
+print(“Paste each scanned QR chunk and press Enter.”)
+print(“Type  done  (or leave blank and press Enter twice) when finished.\n”)
+lines = []
+blank_count = 0
+while True:
 try:
-with open(fpath, ‘rb’) as f:
-data = f.read()
-entries.append({‘p’: rel, ‘d’: base64.b64encode(data).decode()})
-print(f”  + {rel}  ({len(data)} bytes)”)
-except Exception as e:
-print(f”  ! skipping {rel}: {e}”)
-return entries
+line = input(f”  Chunk [{len(lines)+1}]: “).strip()
+except (EOFError, KeyboardInterrupt):
+break
+if line.lower() == ‘done’:
+break
+if line == ‘’:
+blank_count += 1
+if blank_count >= 2:
+break
+continue
+blank_count = 0
+lines.append(line)
+return lines
 
-def build_chunks(entries: list[dict], chunk_size: int = 800) -> list[str]:
-“””
-Serialize entries to JSON, split into chunk_size-byte pieces.
-Each chunk is a plain string: “INDEX/TOTAL:payload”
-payload is a slice of the base64-encoded full JSON.
-“””
-full_json  = json.dumps(entries, separators=(’,’, ‘:’))
-full_b64   = base64.b64encode(full_json.encode()).decode()
-total      = math.ceil(len(full_b64) / chunk_size)
-chunks     = []
-for i in range(total):
-piece = full_b64[i * chunk_size : (i + 1) * chunk_size]
-chunks.append(f”{i+1}/{total}:{piece}”)
-return chunks
-
-# ── Generate QR images ─────────────────────────────────────────────────────────
-
-def make_qr_image(text: str):
-“””
-Return a QR code as a QPixmap.
-Tries Pillow first, then pure-PNG fallback.
-“””
-import qrcode
+def reassemble(raw_lines: list[str]) -> bytes:
+chunks = {}
+total_expected = None
 
 ```
-qr = qrcode.QRCode(
-    error_correction=qrcode.constants.ERROR_CORRECT_M,
-    box_size=10,
-    border=4,
-)
-qr.add_data(text)
-qr.make(fit=True)
+for line in raw_lines:
+    parsed = parse_chunk(line)
+    if parsed is None:
+        print(f"  ! Skipping unrecognized line: {line[:60]!r}")
+        continue
+    idx, total, payload = parsed
+    if total_expected is None:
+        total_expected = total
+    elif total != total_expected:
+        print(f"  ! Warning: inconsistent total ({total} vs {total_expected})")
+    chunks[idx] = payload
 
-# Try Pillow path
-try:
-    img = qr.make_image(fill_color="black", back_color="white")
-    import io
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-    from PySide6.QtGui import QPixmap
-    px = QPixmap()
-    px.loadFromData(buf.read())
-    return px
-except Exception:
-    pass
+if total_expected is None:
+    raise ValueError("No valid chunks found!")
 
-# Fallback: pure PNG via qrcode's built-in pypng support
-try:
-    from qrcode.image.pure import PyPNGImage
-    img = qr.make_image(image_factory=PyPNGImage)
-    import io
-    buf = io.BytesIO()
-    img.save(buf)
-    buf.seek(0)
-    from PySide6.QtGui import QPixmap
-    px = QPixmap()
-    px.loadFromData(buf.read())
-    return px
-except Exception as e:
-    raise RuntimeError(f"Cannot generate QR image: {e}")
+missing = [i for i in range(1, total_expected + 1) if i not in chunks]
+if missing:
+    raise ValueError(
+        f"Missing chunks: {missing}\n"
+        f"Got {len(chunks)}/{total_expected}. Scan those QR codes and try again."
+    )
+
+full_b64 = ''.join(chunks[i] for i in range(1, total_expected + 1))
+full_json = base64.b64decode(full_b64).decode('utf-8')
+return full_json
 ```
 
-# ── PySide6 slideshow ──────────────────────────────────────────────────────────
-
-def run_slideshow(chunks: list[str]):
-from PySide6.QtWidgets import (
-QApplication, QWidget, QLabel, QVBoxLayout, QSizePolicy
-)
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeyEvent
-
-```
-app = QApplication.instance() or QApplication(sys.argv)
-
-total = len(chunks)
-print(f"\nGenerating {total} QR codes… (this may take a moment)")
-pixmaps = []
-for i, chunk in enumerate(chunks):
-    print(f"  QR {i+1}/{total}…", end='\r')
-    pixmaps.append(make_qr_image(chunk))
-print(f"  Done! {total} QR codes ready.          ")
-
-class Slideshow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.idx = 0
-        self.setWindowTitle("QR Transfer — click or Space to advance")
-        self.setStyleSheet("background: white;")
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        self.qr_label = QLabel(alignment=Qt.AlignCenter)
-        self.qr_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.qr_label)
-
-        self.info_label = QLabel(alignment=Qt.AlignCenter)
-        self.info_label.setStyleSheet("font-size: 28px; font-weight: bold; color: #333;")
-        layout.addWidget(self.info_label)
-
-        self.hint_label = QLabel(
-            "SPACE / click = next  |  BACKSPACE = back  |  ESC = quit",
-            alignment=Qt.AlignCenter
-        )
-        self.hint_label.setStyleSheet("font-size: 14px; color: #888;")
-        layout.addWidget(self.hint_label)
-
-        self.show_current()
-        self.showFullScreen()
-
-    def show_current(self):
-        px = pixmaps[self.idx]
-        # Scale to fill most of the screen keeping aspect ratio
-        screen = QApplication.primaryScreen().size()
-        max_side = int(min(screen.width(), screen.height()) * 0.75)
-        self.qr_label.setPixmap(
-            px.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-        self.info_label.setText(f"QR  {self.idx + 1}  /  {total}")
-
-    def advance(self, delta: int):
-        self.idx = max(0, min(total - 1, self.idx + delta))
-        self.show_current()
-
-    def mousePressEvent(self, event):
-        self.advance(+1)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        key = event.key()
-        if key in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Right):
-            self.advance(+1)
-        elif key in (Qt.Key_Backspace, Qt.Key_Left):
-            self.advance(-1)
-        elif key == Qt.Key_Escape:
-            self.close()
-
-win = Slideshow()
-app.exec()
-```
+def write_files(json_str: str, out_dir: str):
+entries = json.loads(json_str)
+os.makedirs(out_dir, exist_ok=True)
+print(f”\nWriting {len(entries)} file(s) to ./{out_dir}/\n”)
+for entry in entries:
+rel_path = entry[‘p’]
+data     = base64.b64decode(entry[‘d’])
+dest     = os.path.join(out_dir, rel_path)
+os.makedirs(os.path.dirname(dest) or ‘.’, exist_ok=True)
+with open(dest, ‘wb’) as f:
+f.write(data)
+print(f”  ✓  {rel_path}  ({len(data)} bytes)”)
+print(f”\nDone! Files saved to: {os.path.abspath(out_dir)}”)
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if **name** == ‘**main**’:
-root = sys.argv[1] if len(sys.argv) > 1 else ‘.’
-print(f”Scanning: {os.path.abspath(root)}\n”)
-entries = collect_files(root)
-if not entries:
-print(“No files found!”)
-sys.exit(1)
-print(f”\nFound {len(entries)} file(s).”)
-chunks = build_chunks(entries, chunk_size=800)
-print(f”Split into {len(chunks)} QR chunk(s).\n”)
-run_slideshow(chunks)
+if len(sys.argv) > 1:
+path = sys.argv[1]
+print(f”Reading chunks from: {path}\n”)
+raw_lines = collect_from_file(path)
+print(f”Found {len(raw_lines)} candidate line(s).”)
+else:
+raw_lines = collect_interactive()
+
+```
+try:
+    json_str = reassemble(raw_lines)
+    write_files(json_str, OUT_DIR)
+except ValueError as e:
+    print(f"\n✗ Error: {e}")
+    sys.exit(1)
+```
