@@ -158,9 +158,17 @@ class ExportPagesDialog(QDialog):
         layout.addWidget(self.separate_checkbox)
 
         # ── Row 5: Format combo ─────────────────────────────────────────
+        # Maps display label -> internal format key used during saving
+        self._fmt_map = [
+            ("PDF (документ)",  "PDF"),
+            ("PNG (изображение)", "PNG"),
+            ("JPEG (изображение)", "JPEG"),
+            ("BMP (изображение)",  "BMP"),
+        ]
         fmt_layout = QHBoxLayout()
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["PDF", "PNG", "JPEG", "BMP"])
+        for label, _ in self._fmt_map:
+            self.format_combo.addItem(label)
         self.format_combo.setEnabled(False)
         fmt_layout.addSpacing(20)
         fmt_layout.addWidget(self.format_combo)
@@ -187,6 +195,8 @@ class ExportPagesDialog(QDialog):
     # ------------------------------------------------------------------ #
     def _on_separate_toggled(self, checked: bool):
         self.format_combo.setEnabled(checked)
+        if not checked:
+            self.format_combo.setCurrentIndex(0)  # back to "PDF (документ)"
 
     def _parse_range(self):
         """Validate inputs and return (from_0, to_0) 0-based inclusive, or raise ValueError."""
@@ -222,8 +232,8 @@ class ExportPagesDialog(QDialog):
         return list(range(from_0, to_0 + 1))
 
     def get_format(self) -> str:
-        """Return selected format string: 'PDF', 'PNG', 'JPEG', or 'BMP'."""
-        return self.format_combo.currentText()
+        """Return internal format key: 'PDF', 'PNG', 'JPEG', or 'BMP'."""
+        return self._fmt_map[self.format_combo.currentIndex()][1]
 
     def is_separate_files(self) -> bool:
         return self.separate_checkbox.isChecked()
