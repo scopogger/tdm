@@ -1,242 +1,190 @@
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QDialogButtonBox,
-    QCheckBox, QComboBox, QPushButton, QSpacerItem, QSizePolicy
-)
-from PySide6.QtCore import Qt
-from typing import List, Dict, Any
+"""
+email_sender.py – Opens the system default mail client with the given file
+already attached.  Supports Windows (Outlook via COM) and Linux
+(xdg-email → Evolution / R7 Organiser / any XDG-compliant client).
+"""
 
-PAGES_DIALOG_CONFIG: Dict[str, Dict[str, Any]] = {
-    "DELETE": {
-        "title": "Удаление страниц",
-        "instruction": "Введите номера страниц для удаления (например: 1,3,5-7,10):",
-        "placeholder": "1,3,5-7,10",
-        "error_prefix": "Ошибка при удалении: ",
-        "ok_button": "Удалить",
-    },
-    "EXPORT": {
-        "title": "Экспорт страниц",
-        "instruction": "Введите номера страниц для экспорта (например: 1,3,5-7,10):",
-        "placeholder": "1,3,5-7,10",
-        "error_prefix": "Ошибка при экспорте: ",
-        "ok_button": "Экспортировать",
-    },
-    "BLANK": {
-        "title": "Выбор страниц",
-        "instruction": "Введите номера страниц для удаления (например: 1,3,5-7,10):",
-        "placeholder": "1,3,5-7,10",
-        "error_prefix": "Ошибка при выполнении действий: ",
-        "ok_button": "ОК",
-    },
-}
+import os
+import sys
+import subprocess
+from urllib.parse import quote
+
+from PySide6.QtWidgets import QMessageBox
 
 
-class PagesRangeDialog(QDialog):
-    """Dialog for entering page ranges to process (e.g., '1,3,5-7,10')"""
-    def __init__(self, parent=None, dialog_type: str = "BLANK"):
-        super().__init__(parent)
-        config = PAGES_DIALOG_CONFIG.get(dialog_type.upper(), PAGES_DIALOG_CONFIG["BLANK"])
-        if not config:
-            raise ValueError(f"Неподдерживаемый тип операции: {dialog_type}. Используйте: {list(PAGES_DIALOG_CONFIG.keys())}")
+class EmailSender:
+    """
+    Opens the platform's default mail client with *file_path* pre-attached.
 
-        self.setWindowTitle(config["title"])
-        self.setModal(True)
+    Usage:
+        ok = EmailSender.send(parent_widget, file_path)
+    """
 
-        layout = QVBoxLayout()
+    @staticmethod
+    def send(parent, file_path: str) -> bool:
+        """
+        Try to open a new mail draft with *file_path* attached.
+        Returns True if the client was launched without an obvious error.
+        Shows an error dialog and returns False on failure.
+        """
+        if not os.path.isfile(file_path):
+            QMessageBox.warning(parent, "Ошибка", f"Файл не найден:\n{file_path}")
+            return False
 
-        label = QLabel(config["instruction"])
-        label.setWordWrap(True)
-        layout.addWidget(label)
+        subject = os.path.basename(file_path)
+        body    = f"В приложении PDF документ: {subject}"
 
-        self.input_line_edit = QLineEdit()
-        self.input_line_edit.setPlaceholderText(config["placeholder"])
-        layout.addWidget(self.input_line_edit)
-
-        self.error_label = QLabel("")
-        self.error_label.setStyleSheet("color: red;")
-        self.error_label.setVisible(False)
-        layout.addWidget(self.error_label)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText(config["ok_button"])
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        self.setLayout(layout)
-
-        self.total_pages = 0
-        if parent and hasattr(parent, 'ui') and hasattr(parent.ui, 'pdfView'):
-            self.total_pages = getattr(parent.ui.pdfView, 'get_total_page_count', lambda: 0)()
-        print(f"Total pages counted: {self.total_pages}")
-
-        current_page = 0
-        if parent and hasattr(parent, 'ui') and hasattr(parent.ui, 'pdfView'):
-            current_page = getattr(parent.ui.pdfView, 'get_current_page', lambda: 0)()
-        if current_page is not None and self.total_pages > 0:
-            self.input_line_edit.setText(f"{current_page + 1}")
-
-        # Store config for later use (e.g., validation)
-        self.config = config
-
-    def get_page_ranges(self) -> List[int]:
-        """Parse user input and return list of 0-based page indices to delete"""
-        text = self.input_line_edit.text().strip()
-        if not text:
-            return []
-
-        pages_to_delete = set()
-        parts = [p.strip() for p in text.split(',')]
-
-        try:
-            for part in parts:
-                if '-' in part:
-                    start, end = part.split('-', 1)
-                    start = int(start.strip())
-                    end = int(end.strip())
-                    if not (1 <= start <= self.total_pages and 1 <= end <= self.total_pages):
-                        raise ValueError(f"Страницы {start}-{end} вне диапазона страниц документа (1–{self.total_pages})")
-                    pages_to_delete.update(range(start - 1, end))  # convert to 0-based
-                else:
-                    page = int(part.strip())
-                    if not (1 <= page <= self.total_pages):
-                        raise ValueError(f"Страница {page} вне диапазона страниц документа (1–{self.total_pages})")
-                    pages_to_delete.add(page - 1)  # convert to 0-based
-        except ValueError as e:
-            self.error_label.setText(str(e))
-            self.error_label.setVisible(True)
-            raise ValueError(str(e))
-
-        return sorted(pages_to_delete)
-
-
-class ExportPagesDialog(QDialog):
-    """Dialog for configuring page export: range, format, and separate-files option."""
-
-    def __init__(self, parent=None, total_pages: int = 1, current_page: int = 1):
-        super().__init__(parent)
-        self.total_pages = total_pages
-        self.setWindowTitle("Экспорт страниц")
-        self.setModal(True)
-        self.setMinimumWidth(380)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
-
-        # ── Row 1: From / To ────────────────────────────────────────────
-        range_layout = QHBoxLayout()
-        range_layout.addWidget(QLabel("С:"))
-
-        self.from_input = QLineEdit()
-        self.from_input.setFixedWidth(55)
-        self.from_input.setText(str(current_page))
-        range_layout.addWidget(self.from_input)
-
-        range_layout.addWidget(QLabel("по:"))
-
-        self.to_input = QLineEdit()
-        self.to_input.setFixedWidth(55)
-        self.to_input.setText(str(total_pages))
-        range_layout.addWidget(self.to_input)
-
-        self.total_label = QLabel(f"из {total_pages}")
-        range_layout.addWidget(self.total_label)
-        range_layout.addStretch()
-        layout.addLayout(range_layout)
-
-        # ── Row 2: error label ───────────────────────────────────────────
-        self.error_label = QLabel("")
-        self.error_label.setStyleSheet("color: red;")
-        self.error_label.setVisible(False)
-        layout.addWidget(self.error_label)
-
-        # ── Row 3: Delete after export checkbox ─────────────────────────
-        self.delete_checkbox = QCheckBox("Удалить страницы после извлечения")
-        layout.addWidget(self.delete_checkbox)
-
-        # ── Row 4: Separate files checkbox ──────────────────────────────
-        self.separate_checkbox = QCheckBox("Сохранить страницы как отдельные файлы с расширением:")
-        layout.addWidget(self.separate_checkbox)
-
-        # ── Row 5: Format combo ─────────────────────────────────────────
-        # Maps display label -> internal format key used during saving
-        self._fmt_map = [
-            ("PDF (документ)",  "PDF"),
-            ("PNG (изображение)", "PNG"),
-            ("JPEG (изображение)", "JPEG"),
-            ("BMP (изображение)",  "BMP"),
-        ]
-        fmt_layout = QHBoxLayout()
-        self.format_combo = QComboBox()
-        for label, _ in self._fmt_map:
-            self.format_combo.addItem(label)
-        self.format_combo.setEnabled(False)
-        fmt_layout.addSpacing(20)
-        fmt_layout.addWidget(self.format_combo)
-        fmt_layout.addStretch()
-        layout.addLayout(fmt_layout)
-
-        self.separate_checkbox.toggled.connect(self._on_separate_toggled)
-
-        # ── Row 5: Export / Cancel buttons ──────────────────────────────
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        self.export_btn = QPushButton("Экспортировать")
-        self.export_btn.setDefault(True)
-        self.export_btn.clicked.connect(self._on_export_clicked)
-        btn_layout.addWidget(self.export_btn)
-
-        cancel_btn = QPushButton("Отмена")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        layout.addLayout(btn_layout)
+        if sys.platform == "win32":
+            return EmailSender._send_windows(parent, file_path, subject, body)
+        else:
+            return EmailSender._send_linux(parent, file_path, subject, body)
 
     # ------------------------------------------------------------------ #
-    def _on_separate_toggled(self, checked: bool):
-        self.format_combo.setEnabled(checked)
-        if not checked:
-            self.format_combo.setCurrentIndex(0)  # back to "PDF (документ)"
-
-    def _parse_range(self):
-        """Validate inputs and return (from_0, to_0) 0-based inclusive, or raise ValueError."""
+    #  Windows                                                             #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _send_windows(parent, file_path: str, subject: str, body: str) -> bool:
+        """
+        Primary:  Outlook COM automation — opens a draft, attaches the file,
+                  and displays the compose window.  User can edit & send.
+        Fallback: xdg-email / webbrowser mailto: (no attachment possible on
+                  non-Outlook clients, so we warn the user).
+        """
         try:
-            from_page = int(self.from_input.text().strip())
-            to_page = int(self.to_input.text().strip())
-        except ValueError:
-            raise ValueError("Введите целые числа в поля «С» и «по».")
+            import win32com.client as win32
+            ol = win32.Dispatch("Outlook.Application")
+            mail = ol.CreateItem(0)          # 0 = olMailItem
+            mail.Subject = subject
+            mail.Body    = body
+            mail.Attachments.Add(file_path)
+            mail.Display()                   # show compose window; don't auto-send
+            return True
+        except Exception as e:
+            print(f"[EmailSender] Outlook COM failed: {e}")
 
-        if not (1 <= from_page <= self.total_pages):
-            raise ValueError(f"Начальная страница должна быть от 1 до {self.total_pages}.")
-        if not (1 <= to_page <= self.total_pages):
-            raise ValueError(f"Конечная страница должна быть от 1 до {self.total_pages}.")
-        if from_page > to_page:
-            raise ValueError("Начальная страница не может быть больше конечной.")
+        # Outlook unavailable — fall back to mailto: (no attachment)
+        return EmailSender._send_mailto_fallback(parent, file_path, subject, body)
 
-        return from_page - 1, to_page - 1  # 0-based
+    # ------------------------------------------------------------------ #
+    #  Linux                                                               #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _send_linux(parent, file_path: str, subject: str, body: str) -> bool:
+        """
+        Try strategies in order, stop at the first success.
 
-    def _on_export_clicked(self):
-        self.error_label.setVisible(False)
+        1. xdg-email --attach  (freedesktop standard; works with Evolution,
+                                Thunderbird, R7 Organiser when registered)
+        2. evolution --component=mail mailto:  with attach= in the URI
+        3. R7 Organiser direct call (same mailto URI style)
+        4. mailto: fallback via xdg-open / webbrowser (no attachment)
+        """
+
+        # 1 ── xdg-email (best option: handles attachment portably) ──────
+        if EmailSender._which("xdg-email"):
+            try:
+                cmd = [
+                    "xdg-email",
+                    "--subject", subject,
+                    "--body",    body,
+                    "--attach",  file_path,
+                ]
+                result = subprocess.run(
+                    cmd,
+                    timeout=10,
+                    start_new_session=True,
+                )
+                if result.returncode == 0:
+                    return True
+                print(f"[EmailSender] xdg-email exited with code {result.returncode}")
+            except Exception as e:
+                print(f"[EmailSender] xdg-email failed: {e}")
+
+        # 2 ── Evolution directly ─────────────────────────────────────────
+        evolution = EmailSender._find_binary(
+            ["evolution", "/usr/bin/evolution", "/usr/local/bin/evolution"]
+        )
+        if evolution:
+            try:
+                # Evolution understands attach= inside the mailto URI
+                uri = (
+                    f"mailto:?subject={quote(subject)}"
+                    f"&body={quote(body)}"
+                    f"&attach={quote('file://' + file_path)}"
+                )
+                subprocess.Popen(
+                    [evolution, "--component=mail", uri],
+                    start_new_session=True,
+                )
+                return True
+            except Exception as e:
+                print(f"[EmailSender] Evolution failed: {e}")
+
+        # 3 ── R7 Organiser ───────────────────────────────────────────────
+        r7 = EmailSender._find_binary([
+            "/opt/r7-office/organizer/r7organizer",
+            "/opt/r7office/organizer/r7organizer",
+        ])
+        if r7:
+            try:
+                uri = (
+                    f"mailto:?subject={quote(subject)}"
+                    f"&body={quote(body)}"
+                    f"&attach={quote('file://' + file_path)}"
+                )
+                subprocess.Popen([r7, uri], start_new_session=True)
+                return True
+            except Exception as e:
+                print(f"[EmailSender] R7 Organiser failed: {e}")
+
+        # 4 ── mailto: fallback (no attachment) ───────────────────────────
+        return EmailSender._send_mailto_fallback(parent, file_path, subject, body)
+
+    # ------------------------------------------------------------------ #
+    #  Fallback – mailto: without attachment                               #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _send_mailto_fallback(parent, file_path: str, subject: str, body: str) -> bool:
+        """
+        Opens a bare mailto: link (no attachment support).
+        Informs the user where the file is so they can attach it manually.
+        """
+        import webbrowser
+        mailto = f"mailto:?subject={quote(subject)}&body={quote(body)}"
         try:
-            self._parse_range()
-        except ValueError as e:
-            self.error_label.setText(str(e))
-            self.error_label.setVisible(True)
-            return
-        self.accept()
+            webbrowser.open(mailto)
+        except Exception as e:
+            print(f"[EmailSender] webbrowser.open failed: {e}")
+            QMessageBox.critical(
+                parent,
+                "Ошибка",
+                f"Не удалось открыть почтовый клиент.\n\n"
+                f"Прикрепите файл вручную:\n{file_path}",
+            )
+            return False
 
-    # ── Public getters ──────────────────────────────────────────────── #
-    def get_page_range(self) -> List[int]:
-        """Return sorted list of 0-based page indices."""
-        from_0, to_0 = self._parse_range()
-        return list(range(from_0, to_0 + 1))
+        # mailto opened, but we couldn't attach — tell the user
+        QMessageBox.information(
+            parent,
+            "Вложение к письму",
+            f"Почтовый клиент открыт, но файл не удалось прикрепить автоматически.\n\n"
+            f"Прикрепите файл вручную:\n{file_path}",
+        )
+        return True
 
-    def get_format(self) -> str:
-        """Return internal format key: 'PDF', 'PNG', 'JPEG', or 'BMP'."""
-        return self._fmt_map[self.format_combo.currentIndex()][1]
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _which(name: str) -> bool:
+        """True if *name* is found on PATH."""
+        import shutil
+        return shutil.which(name) is not None
 
-    def is_separate_files(self) -> bool:
-        return self.separate_checkbox.isChecked()
-
-    def is_delete_after_export(self) -> bool:
-        return self.delete_checkbox.isChecked()
+    @staticmethod
+    def _find_binary(candidates: list) -> str | None:
+        """Return the first existing path from *candidates*, or None."""
+        for path in candidates:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+        return None
