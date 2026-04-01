@@ -1562,126 +1562,25 @@ class ActionsHandler:
         #     return "cancel"
 
     def email_document(self):
-        """Отправить текущий PDF документ по email с опциями"""
+        """Отправить текущий PDF документ по email."""
         current_path = getattr(self.main_window, 'current_document_path', '')
         if not current_path:
             QMessageBox.warning(self.main_window, "Нет документа", "Пожалуйста, сначала откройте PDF файл.")
             return
 
-        # Обработка несохраненных изменений
         if getattr(self.main_window, 'is_document_modified', False):
             clicked_button = self.save_message_box(
                 "",
-                "В документе есть несохраненные изменения. Хотите сохранить перед отправкой?"
+                "В документе есть несохранённые изменения. Хотите сохранить перед отправкой?"
             )
-
             if clicked_button == QMessageBox.RejectRole:
                 return
             elif clicked_button == QMessageBox.YesRole:
                 if not self.save_file():
                     return
 
-        # # Запрос опций email
-        # subject, ok = QInputDialog.getText(
-        #     self.main_window,
-        #     "Тема письма",
-        #     "Введите тему письма:",
-        #     text=os.path.basename(current_path)
-        # )
-
-        # if not ok:
-        #     return
-
-        subject = os.path.basename(current_path)
-
-        # # Запрос текста письма
-        # body, ok = QInputDialog.getMultiLineText(
-        #     self.main_window,
-        #     "Текст письма",
-        #     "Введите текст письма (опционально):",
-        #     f"В приложении PDF документ: {os.path.basename(current_path)}"
-        # )
-        #
-        # if not ok:
-        #     return
-
-        body = f"В приложении PDF документ: {os.path.basename(current_path)}"
-
-        try:
-            if sys.platform == "win32":
-                self._email_windows_enhanced(subject, body, current_path)
-                print(f"SENDING THIS FILE: {current_path}")
-            elif sys.platform == "linux":
-                self._email_linux_enhanced(subject, body, current_path)
-            else:
-                self._email_generic_enhanced(subject, body, current_path)
-
-        except Exception as e:
-            QMessageBox.critical(
-                self.main_window,
-                "Ошибка отправки",
-                f"Не удалось подготовить email:\n{str(e)}"
-            )
-
-    def _email_windows_enhanced(self, subject, body, file_path):
-        """Улучшенная отправка email в Windows с текстом письма"""
-        try:
-            import win32com.client as win32
-            ol_app = win32.Dispatch('Outlook.Application')
-            mail_item = ol_app.CreateItem(0)
-            mail_item.Subject = subject
-            mail_item.Body = body
-            mail_item.Attachments.Add(file_path)
-            mail_item.Display()
-        except Exception as e:
-            print(f"Outlook недоступен: {e}")
-            self._email_generic_enhanced(subject, body, file_path)
-
-    def _email_linux_enhanced(self, subject, body, file_path):
-        """Улучшенная отправка email в Linux"""
-        # r7_organizer_path = "/opt/r7-office/organizer/r7organizer"
-        # if os.path.exists(r7_organizer_path):
-        try:
-            import subprocess
-            # Evolution может не поддерживать текст в командной строке, используем универсальный вариант
-            self._email_generic_enhanced(subject, body, file_path)
-            return
-        except Exception as e:
-            print(f"Ошибка Evolution почты: {e}")
-
-        self._email_generic_enhanced(subject, body, file_path)
-
-    def _email_generic_enhanced(self, subject, body, file_path):
-        """Улучшенный универсальный вариант для всех платформ"""
-        from urllib.parse import quote
-        import webbrowser
-
-        mailto_link = f"mailto:?subject={quote(subject)}&body={quote(body)}"
-
-        try:
-            webbrowser.open(mailto_link)
-
-            # Показать инструкции по вложению
-            QMessageBox.information(
-                self.main_window,
-                "Вложение к письму",
-                f"Ваш почтовый клиент должен открыться с указанной темой и текстом.\n\n"
-                f"Если Ваш файл не прикрепился, Вы можете сделать это вручную,"
-                f"\nвзяв его по адресу:"
-                f"\n{file_path}\n\n"
-                # f"Файл расположен по адресу:\n{os.path.dirname(file_path)}"
-            )
-        except Exception as e:
-            QMessageBox.information(
-                self.main_window,
-                "Отправка документа по email",
-                f"Чтобы отправить этот документ:\n\n"
-                f"1. Откройте ваш почтовый клиент\n"
-                f"2. Создайте новое сообщение\n"
-                f"3. Тема: {subject}\n"
-                f"4. Текст: {body}\n"
-                f"5. Прикрепите этот файл:\n{file_path}"
-            )
+        from email_sender import EmailSender
+        EmailSender.send(self.main_window, current_path)
 
     def move_page_up(self):
         self._move_page_generic('move_page_up')
