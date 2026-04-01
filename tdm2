@@ -101,8 +101,7 @@ class ActionsHandler:
         if hasattr(self.ui, 'actionDeletePage'):
             self.ui.actionDeletePage.triggered.connect(lambda checked=False: self.delete_pages(current_page=True))
         if hasattr(self.ui, 'actionDeleteSpecificPages'):
-            self.ui.actionDeleteSpecificPages.triggered.connect(
-                lambda checked=False: self.delete_pages(current_page=False))
+            self.ui.actionDeleteSpecificPages.triggered.connect(lambda checked=False: self.delete_pages(current_page=False))
         if hasattr(self.ui, 'actionMovePageUp'):
             self.ui.actionMovePageUp.triggered.connect(self.move_page_up)
         if hasattr(self.ui, 'actionMovePageDown'):
@@ -892,7 +891,8 @@ class ActionsHandler:
             return
 
         separate = dialog.is_separate_files()
-        fmt = dialog.get_format()  # 'PDF', 'PNG', 'JPEG', 'BMP'
+        fmt = dialog.get_format()          # 'PDF', 'PNG', 'JPEG', 'BMP'
+        delete_after = dialog.is_delete_after_export()
 
         last_dir = settings_manager.get_last_directory()
         doc_basename = os.path.splitext(
@@ -920,6 +920,9 @@ class ActionsHandler:
                     new_doc.insert_pdf(cur_doc, from_page=page_num, to_page=page_num)
                 new_doc.save(save_path)
                 new_doc.close()
+                if delete_after:
+                    pv.delete_pages_by_range(pages_to_export)
+                    self.ui.thumbnailList.refresh_thumbnails(pv.document)
                 QMessageBox.information(
                     self.main_window,
                     "Успешно",
@@ -930,9 +933,9 @@ class ActionsHandler:
             return
 
         # ── Separate files ───────────────────────────────────────────────
-        zoom = 4.0  # 300 DPI (72 pt/in × 4 ≈ 288 ≈ 300 DPI)
+        zoom = 4.0          # 300 DPI (72 pt/in × 4 ≈ 288 ≈ 300 DPI)
         fmt_ext = fmt.lower().replace('jpeg', 'jpg')
-        qt_fmt = fmt  # QImage.save() format string
+        qt_fmt  = fmt        # QImage.save() format string
 
         progress = QProgressDialog(
             f"Экспорт {len(pages_to_export)} страниц...", "Отмена",
@@ -989,6 +992,9 @@ class ActionsHandler:
                 f"Успешно: {successful}\nОшибки на страницах: {', '.join(map(str, failed))}"
             )
         else:
+            if delete_after:
+                pv.delete_pages_by_range(pages_to_export)
+                self.ui.thumbnailList.refresh_thumbnails(pv.document)
             QMessageBox.information(
                 self.main_window,
                 "Успешно",
@@ -1009,7 +1015,7 @@ class ActionsHandler:
 
             # Сбор комплексной информации о PDF
             info = doc.current_doc.metadata
-            page_count = doc.get_page_count()  # len(doc)
+            page_count = doc.get_page_count()  #len(doc)
 
             # Информация о файле
             file_size = "Неизвестно"
@@ -1192,16 +1198,16 @@ class ActionsHandler:
         <b>{APP_NAME}</b><br>
         <b>Версия:</b> {APP_VERSION}<br><br>
         {APP_DESCRIPTION}<br><br>
-
+    
         <b>Разработано с использованием:</b><br>
         • <b>PySide6</b> — кроссплатформенный GUI фреймворк (обёртка Qt {self._get_qt_version()} для Python)<br>
         • <b>PyMuPDF (Fitz)</b> — библиотека для высокопроизводительной работы с PDF-документами<br>
         • <b>Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}</b> — язык программирования<br>
         • Стандартные библиотеки Python<br><br>
-
+    
         <b>Редактор PDF Альт разработан </b>ОППО ГИСиСАПР<br>
         ПУ «СургутАСУнефть», ПАО «Сургутнефтегаз».<br><br>
-
+    
         При возникновении проблем обращаться в<br>
         <b>Naumen Service Desk</b>:<br>
         – ИТ-решение: <u>0085</u><br>
@@ -1436,7 +1442,7 @@ class ActionsHandler:
             "Качество сжатия:",
             "Выберите уровень сжатия:",
             list(quality_options.keys()),
-            2,  # По-умолчанию ebook - "Среднее"
+            2,  #  По-умолчанию ebook - "Среднее"
             False
         )
 
