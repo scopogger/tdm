@@ -149,11 +149,15 @@ class ExportPagesDialog(QDialog):
         self.error_label.setVisible(False)
         layout.addWidget(self.error_label)
 
-        # ── Row 3: Separate files checkbox ──────────────────────────────
+        # ── Row 3: Delete after export checkbox ─────────────────────────
+        self.delete_checkbox = QCheckBox("Удалить страницы после извлечения")
+        layout.addWidget(self.delete_checkbox)
+
+        # ── Row 4: Separate files checkbox ──────────────────────────────
         self.separate_checkbox = QCheckBox("Сохранить страницы как отдельные файлы с расширением:")
         layout.addWidget(self.separate_checkbox)
 
-        # ── Row 4: Format combo ─────────────────────────────────────────
+        # ── Row 5: Format combo ─────────────────────────────────────────
         fmt_layout = QHBoxLayout()
         self.format_combo = QComboBox()
         self.format_combo.addItems(["PDF", "PNG", "JPEG", "BMP"])
@@ -223,3 +227,6 @@ class ExportPagesDialog(QDialog):
 
     def is_separate_files(self) -> bool:
         return self.separate_checkbox.isChecked()
+
+    def is_delete_after_export(self) -> bool:
+        return self.delete_checkbox.isChecked()
