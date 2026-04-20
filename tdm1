@@ -68,27 +68,50 @@ class Layer:
 class DroneLayer(Layer):
     def __init__(self):
         super().__init__("Deep Drone",(0.4,0.6,1.0)); self.volume=0.7
+        self._ph1=0.0; self._ph2=0.0; self._ph3=0.0; self._lfo_ph=0.0
     def generate(self,frames):
-        t=self._t+np.arange(frames,dtype=np.float64)
-        f1,f2=55.0,55.14
-        lfo=1.0+0.04*np.sin(TWO_PI*0.07*t/SR)
-        sig=0.6*np.sin(TWO_PI*f1*t/SR)+0.6*np.sin(TWO_PI*f2*t/SR)
-        sig+=0.25*np.sin(TWO_PI*f1*2*t/SR)
-        return sig*lfo/1.45
+        f1,f2=55.0,55.14; f3=f1*2; lfo_f=0.07
+        dp1=TWO_PI*f1/SR; dp2=TWO_PI*f2/SR; dp3=TWO_PI*f3/SR; dlfo=TWO_PI*lfo_f/SR
+        sig=np.empty(frames)
+        p1,p2,p3,pl=self._ph1,self._ph2,self._ph3,self._lfo_ph
+        for n in range(frames):
+            lfo=1.0+0.04*math.sin(pl)
+            sig[n]=(0.6*math.sin(p1)+0.6*math.sin(p2)+0.25*math.sin(p3))*lfo/1.45
+            p1+=dp1; p2+=dp2; p3+=dp3; pl+=dlfo
+        self._ph1=p1%TWO_PI; self._ph2=p2%TWO_PI; self._ph3=p3%TWO_PI; self._lfo_ph=pl%TWO_PI
+        return sig
 
 class ShimmerLayer(Layer):
     def __init__(self):
         super().__init__("Shimmer",(0.75,0.55,1.0)); self.volume=0.45
+        base=293.66
+        ratios=[1.0,1.5,2.0,3.0,4.0]
+        self._phases=[0.0]*len(ratios)   # one phase per harmonic
+        self._lfo_phases=[0.0]*len(ratios)
+        self._sh_ph=0.0; self._sh_lfo_ph=0.0
+        self._freqs=[base*r for r in ratios]
+        self._amps=[1.0,0.55,0.35,0.18,0.08]
+        self._lfo_rates=[0.11+r*0.04 for r in ratios]
     def generate(self,frames):
-        t=self._t+np.arange(frames,dtype=np.float64)
-        base=293.66; sig=np.zeros(frames)
-        ratios=[1.0,1.5,2.0,3.0,4.0]; amps=[1.0,0.55,0.35,0.18,0.08]
-        for r,a in zip(ratios,amps):
-            lfo=1.0+0.07*np.sin(TWO_PI*(0.11+r*0.04)*t/SR)
-            sig+=a*lfo*np.sin(TWO_PI*base*r*t/SR)
-        sh=np.sin(TWO_PI*0.23*t/SR)*0.5+0.5
-        sig+=0.12*sh*np.sin(TWO_PI*base*8*t/SR)
-        return sig/(sum(amps)+0.12)
+        sig=np.zeros(frames)
+        total=sum(self._amps)+0.12
+        for hi,(freq,amp,lfo_rate) in enumerate(zip(self._freqs,self._amps,self._lfo_rates)):
+            dp=TWO_PI*freq/SR; dlfo=TWO_PI*lfo_rate/SR
+            ph=self._phases[hi]; lph=self._lfo_phases[hi]
+            for n in range(frames):
+                lfo=1.0+0.07*math.sin(lph)
+                sig[n]+=amp*lfo*math.sin(ph)
+                ph+=dp; lph+=dlfo
+            self._phases[hi]=ph%TWO_PI; self._lfo_phases[hi]=lph%TWO_PI
+        # shimmer high partial
+        sh_freq=293.66*8; dp_sh=TWO_PI*sh_freq/SR; dlfo_sh=TWO_PI*0.23/SR
+        ph=self._sh_ph; lph=self._sh_lfo_ph
+        for n in range(frames):
+            env=math.sin(lph)*0.5+0.5
+            sig[n]+=0.12*env*math.sin(ph)
+            ph+=dp_sh; lph+=dlfo_sh
+        self._sh_ph=ph%TWO_PI; self._sh_lfo_ph=lph%TWO_PI
+        return sig/total
 
 class RainLayer(Layer):
     def __init__(self):
@@ -121,13 +144,18 @@ class RainLayer(Layer):
 class WindLayer(Layer):
     def __init__(self):
         super().__init__("Wind",(0.5,0.85,0.6)); self._br=0.0; self._lp=0.0; self.volume=0.4
+        self._lfo1_ph=0.0; self._lfo2_ph=0.0
     def generate(self,frames):
         w=np.random.randn(frames); out=np.empty(frames); s=self._br
         for i,x in enumerate(w): s=(s+0.02*x)/1.02; out[i]=s
         self._br=s
-        t=self._t+np.arange(frames,dtype=np.float64)
-        lfo=(0.5+0.5*np.sin(TWO_PI*0.04*t/SR))*(0.5+0.5*np.sin(TWO_PI*0.11*t/SR+1.3))
-        mod=0.3+0.7*lfo
+        dlfo1=TWO_PI*0.04/SR; dlfo2=TWO_PI*0.11/SR
+        lp1,lp2=self._lfo1_ph,self._lfo2_ph
+        mod=np.empty(frames)
+        for n in range(frames):
+            mod[n]=0.3+0.7*(0.5+0.5*math.sin(lp1))*(0.5+0.5*math.sin(lp2))
+            lp1+=dlfo1; lp2+=dlfo2
+        self._lfo1_ph=lp1%TWO_PI; self._lfo2_ph=lp2%TWO_PI
         lp=self._lp
         for i in range(frames): lp=lp*0.998+out[i]*0.002; out[i]=lp
         self._lp=lp
@@ -136,11 +164,18 @@ class WindLayer(Layer):
 class PulseLayer(Layer):
     def __init__(self):
         super().__init__("Pulse",(1.0,0.65,0.5)); self.volume=0.4
+        self._env_ph=0.0; self._ph1=0.0; self._ph2=0.0; self._ph3=0.0
     def generate(self,frames):
-        t=self._t+np.arange(frames,dtype=np.float64)
-        env=(np.sin(TWO_PI*0.22*t/SR)*0.5+0.5)**4; f=82.41
-        sig=env*(np.sin(TWO_PI*f*t/SR)+0.4*np.sin(TWO_PI*f*1.5*t/SR)+0.2*np.sin(TWO_PI*f*2*t/SR))
-        return sig*0.7
+        f=82.41
+        denv=TWO_PI*0.22/SR; dp1=TWO_PI*f/SR; dp2=TWO_PI*f*1.5/SR; dp3=TWO_PI*f*2/SR
+        sig=np.empty(frames)
+        ep,p1,p2,p3=self._env_ph,self._ph1,self._ph2,self._ph3
+        for n in range(frames):
+            env=(math.sin(ep)*0.5+0.5)**4
+            sig[n]=env*(math.sin(p1)+0.4*math.sin(p2)+0.2*math.sin(p3))*0.7
+            ep+=denv; p1+=dp1; p2+=dp2; p3+=dp3
+        self._env_ph=ep%TWO_PI; self._ph1=p1%TWO_PI; self._ph2=p2%TWO_PI; self._ph3=p3%TWO_PI
+        return sig
 
 class BellLayer(Layer):
     NOTES=[261.63,293.66,329.63,392.0,440.0,523.25,587.33,659.25]
@@ -148,8 +183,11 @@ class BellLayer(Layer):
         super().__init__("Bells",(1.0,0.9,0.55))
         self._next=int(random.uniform(2,6)*SR); self._events=[]; self.volume=0.35
     def _tone(self,freq,amp,dur_s):
-        t=np.arange(int(dur_s*SR),dtype=np.float64)
+        n=int(dur_s*SR); t=np.arange(n,dtype=np.float64)
         env=np.exp(-t/(dur_s*SR*0.18))
+        # Short attack ramp to prevent onset click (4ms)
+        attack=min(int(0.004*SR),n)
+        env[:attack]*=np.linspace(0,1,attack)
         return amp*env*(np.sin(TWO_PI*freq*t/SR)+0.35*np.sin(TWO_PI*freq*2.76*t/SR)+0.12*np.sin(TWO_PI*freq*5.4*t/SR))
     def generate(self,frames):
         sig=np.zeros(frames)
