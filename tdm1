@@ -1,519 +1,338 @@
 import sys
+import os
 import numpy as np
 import sounddevice as sd
 import threading
 import time
+import math
+import random
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QFrame
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPropertyAnimation, QEasingCurve, Property
-from PySide6.QtGui import QFont, QColor, QPainter, QRadialGradient, QLinearGradient, QPen, QBrush, QPainterPath
-import math
-import os
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QPainter, QRadialGradient, QBrush, QIcon
 
-# ─────────────────────────────────────────────
-#  AUDIO ENGINE
-# ─────────────────────────────────────────────
+SR     = 44100
+BLOCK  = 1024
+TWO_PI = 2.0 * math.pi
 
-SAMPLE_RATE = 44100
-BLOCK_SIZE  = 2048
+# ── Reverb ────────────────────────────────────────────────────────────────────
+
+class SimpleReverb:
+    COMB_DELAYS    = [1557, 1617, 1491, 1422]
+    ALLPASS_DELAYS = [225, 556]
+    def __init__(self):
+        self._wet  = 0.3
+        self._combs   = [np.zeros(d) for d in self.COMB_DELAYS]
+        self._comb_i  = [0]*4
+        self._ap      = [np.zeros(d) for d in self.ALLPASS_DELAYS]
+        self._ap_i    = [0,0]
+    def set_wet(self, w): self._wet = float(w)
+    def process(self, signal):
+        if self._wet < 0.005: return signal
+        out = np.zeros_like(signal)
+        for i,(buf,dl) in enumerate(zip(self._combs,self.COMB_DELAYS)):
+            idx=self._comb_i[i]; decay=0.84
+            for n,s in enumerate(signal):
+                d=buf[idx]; buf[idx]=s+d*decay; out[n]+=d; idx=(idx+1)%dl
+            self._comb_i[i]=idx
+        out /= len(self.COMB_DELAYS)
+        for i,(buf,dl) in enumerate(zip(self._ap,self.ALLPASS_DELAYS)):
+            idx=self._ap_i[i]; g=0.5; res=np.zeros_like(out)
+            for n,s in enumerate(out):
+                d=buf[idx]; buf[idx]=s+d*g; res[n]=d-g*buf[idx]; idx=(idx+1)%dl
+            self._ap_i[i]=idx; out=res
+        return signal*(1-self._wet)+out*self._wet
+
+# ── Layer base ────────────────────────────────────────────────────────────────
+
+class Layer:
+    def __init__(self,name,color):
+        self.name=name; self.color=color
+        self.enabled=False; self.volume=0.5
+        self._t=0; self._fade=0.0
+    def enable(self,v): self.enabled=v
+    def set_volume(self,v): self.volume=max(0.0,min(1.0,v))
+    def generate(self,frames): raise NotImplementedError
+    def tick(self,frames):
+        target=1.0 if self.enabled else 0.0
+        step=frames/(SR*1.2)
+        self._fade=np.clip(self._fade+(step if target else -step),0,1)
+        if self._fade<0.001: self._t+=frames; return np.zeros(frames)
+        sig=self.generate(frames)*self.volume*self._fade
+        self._t+=frames; return sig
+
+# ── Layers ────────────────────────────────────────────────────────────────────
+
+class DroneLayer(Layer):
+    def __init__(self):
+        super().__init__("Deep Drone",(0.4,0.6,1.0)); self.volume=0.7
+    def generate(self,frames):
+        t=self._t+np.arange(frames,dtype=np.float64)
+        f1,f2=55.0,55.14
+        lfo=1.0+0.04*np.sin(TWO_PI*0.07*t/SR)
+        sig=0.6*np.sin(TWO_PI*f1*t/SR)+0.6*np.sin(TWO_PI*f2*t/SR)
+        sig+=0.25*np.sin(TWO_PI*f1*2*t/SR)
+        return sig*lfo/1.45
+
+class ShimmerLayer(Layer):
+    def __init__(self):
+        super().__init__("Shimmer",(0.75,0.55,1.0)); self.volume=0.45
+    def generate(self,frames):
+        t=self._t+np.arange(frames,dtype=np.float64)
+        base=293.66; sig=np.zeros(frames)
+        ratios=[1.0,1.5,2.0,3.0,4.0]; amps=[1.0,0.55,0.35,0.18,0.08]
+        for r,a in zip(ratios,amps):
+            lfo=1.0+0.07*np.sin(TWO_PI*(0.11+r*0.04)*t/SR)
+            sig+=a*lfo*np.sin(TWO_PI*base*r*t/SR)
+        sh=np.sin(TWO_PI*0.23*t/SR)*0.5+0.5
+        sig+=0.12*sh*np.sin(TWO_PI*base*8*t/SR)
+        return sig/(sum(amps)+0.12)
+
+class RainLayer(Layer):
+    def __init__(self):
+        super().__init__("Rain",(0.4,0.8,0.7))
+        self._pb=np.zeros(7); self._dtimer=0
+        self._dbuf=np.zeros(512); self._dpos=512; self.volume=0.55
+    def _pink(self,w):
+        b=self._pb; out=np.empty_like(w)
+        for i,x in enumerate(w):
+            b[0]=0.99886*b[0]+x*0.0555179; b[1]=0.99332*b[1]+x*0.0750759
+            b[2]=0.96900*b[2]+x*0.1538520; b[3]=0.86650*b[3]+x*0.3104856
+            b[4]=0.55000*b[4]+x*0.5329522; b[5]=-0.7616*b[5]-x*0.0168980
+            out[i]=(b[0]+b[1]+b[2]+b[3]+b[4]+b[5]+b[6]+x*0.5362)*0.11
+            b[6]=x*0.115926
+        self._pb=b; return out
+    def generate(self,frames):
+        sig=self._pink(np.random.randn(frames))*0.9
+        pos=self._dpos
+        for n in range(frames):
+            if pos>=len(self._dbuf):
+                self._dtimer+=1
+                ivl=int(random.uniform(0.05,0.35)*SR)
+                if self._dtimer%max(1,ivl//BLOCK)==0:
+                    amp=random.uniform(0.15,0.5); dur=random.randint(80,300)
+                    env=np.exp(-np.arange(dur)/(dur*0.15))
+                    self._dbuf=amp*env*np.random.randn(dur); pos=0
+            if pos<len(self._dbuf): sig[n]+=self._dbuf[pos]; pos+=1
+        self._dpos=pos; return sig
+
+class WindLayer(Layer):
+    def __init__(self):
+        super().__init__("Wind",(0.5,0.85,0.6)); self._br=0.0; self._lp=0.0; self.volume=0.4
+    def generate(self,frames):
+        w=np.random.randn(frames); out=np.empty(frames); s=self._br
+        for i,x in enumerate(w): s=(s+0.02*x)/1.02; out[i]=s
+        self._br=s
+        t=self._t+np.arange(frames,dtype=np.float64)
+        lfo=(0.5+0.5*np.sin(TWO_PI*0.04*t/SR))*(0.5+0.5*np.sin(TWO_PI*0.11*t/SR+1.3))
+        mod=0.3+0.7*lfo
+        lp=self._lp
+        for i in range(frames): lp=lp*0.998+out[i]*0.002; out[i]=lp
+        self._lp=lp
+        out*=mod; peak=np.max(np.abs(out))+1e-9; return out/peak*0.6
+
+class PulseLayer(Layer):
+    def __init__(self):
+        super().__init__("Pulse",(1.0,0.65,0.5)); self.volume=0.4
+    def generate(self,frames):
+        t=self._t+np.arange(frames,dtype=np.float64)
+        env=(np.sin(TWO_PI*0.22*t/SR)*0.5+0.5)**4; f=82.41
+        sig=env*(np.sin(TWO_PI*f*t/SR)+0.4*np.sin(TWO_PI*f*1.5*t/SR)+0.2*np.sin(TWO_PI*f*2*t/SR))
+        return sig*0.7
+
+class BellLayer(Layer):
+    NOTES=[261.63,293.66,329.63,392.0,440.0,523.25,587.33,659.25]
+    def __init__(self):
+        super().__init__("Bells",(1.0,0.9,0.55))
+        self._next=int(random.uniform(2,6)*SR); self._events=[]; self.volume=0.35
+    def _tone(self,freq,amp,dur_s):
+        t=np.arange(int(dur_s*SR),dtype=np.float64)
+        env=np.exp(-t/(dur_s*SR*0.18))
+        return amp*env*(np.sin(TWO_PI*freq*t/SR)+0.35*np.sin(TWO_PI*freq*2.76*t/SR)+0.12*np.sin(TWO_PI*freq*5.4*t/SR))
+    def generate(self,frames):
+        sig=np.zeros(frames)
+        if self._t>=self._next:
+            tone=self._tone(random.choice(self.NOTES),random.uniform(0.3,0.7),random.uniform(1.8,4.0))
+            self._events.append([self._t,tone])
+            self._next=self._t+int(random.uniform(3,10)*SR)
+        alive=[]
+        for ev in self._events:
+            st,tone=ev; off=self._t-st
+            if off>=len(tone): continue
+            av=min(frames,len(tone)-off); sig[:av]+=tone[off:off+av]; alive.append(ev)
+        self._events=alive; return sig
+
+class NoiseLayer(Layer):
+    def __init__(self):
+        super().__init__("Noise",(0.65,0.65,0.7)); self._pb=np.zeros(7); self._br=0.0; self.volume=0.3
+    def _pink(self,w):
+        b=self._pb; out=np.empty_like(w)
+        for i,x in enumerate(w):
+            b[0]=0.99886*b[0]+x*0.0555179; b[1]=0.99332*b[1]+x*0.0750759
+            b[2]=0.96900*b[2]+x*0.1538520; b[3]=0.86650*b[3]+x*0.3104856
+            b[4]=0.55000*b[4]+x*0.5329522; b[5]=-0.7616*b[5]-x*0.0168980
+            out[i]=(b[0]+b[1]+b[2]+b[3]+b[4]+b[5]+b[6]+x*0.5362)*0.11
+            b[6]=x*0.115926
+        self._pb=b; return out
+    def generate(self,frames):
+        w=np.random.randn(frames); p=self._pink(w.copy())
+        out=np.empty(frames); s=self._br
+        for i,x in enumerate(w): s=(s+0.02*x)/1.02; out[i]=s
+        self._br=s; brown=out/(np.max(np.abs(out))+1e-9)*0.5
+        return w*0.15+p*0.5+brown*0.35
+
+# ── Engine ────────────────────────────────────────────────────────────────────
 
 class AudioEngine:
-    """Generates ambient sound in real time using numpy."""
-
-    MOODS = {
-        "Focus": {
-            "desc": "steady warmth, no distractions",
-            "base_freq": 55.0,       # A1 — deep, grounding
-            "harmonics": [1, 2, 3],
-            "harmonic_amps": [1.0, 0.4, 0.15],
-            "noise_color": "brown",
-            "noise_level": 0.04,
-            "pulse": False,
-            "shimmer": False,
-        },
-        "Dreamy": {
-            "desc": "soft pads, evolving shimmer",
-            "base_freq": 146.83,     # D3 — airy, luminous
-            "harmonics": [1, 1.5, 2, 3, 4],
-            "harmonic_amps": [1.0, 0.6, 0.35, 0.2, 0.08],
-            "noise_color": "pink",
-            "noise_level": 0.02,
-            "pulse": False,
-            "shimmer": True,
-        },
-        "Rain": {
-            "desc": "textured noise, gentle pulse",
-            "base_freq": 82.41,      # E2 — warm low hum
-            "harmonics": [1, 2],
-            "harmonic_amps": [1.0, 0.3],
-            "noise_color": "white",
-            "noise_level": 0.18,
-            "pulse": True,
-            "shimmer": False,
-        },
-    }
-
     def __init__(self):
-        self.mood       = "Focus"
-        self.volume     = 0.35
-        self.intensity  = 0.5       # 0..1 — affects harmonic richness & noise
-        self._playing   = False
-        self._lock      = threading.Lock()
-        self._phase     = 0.0
-        self._t         = 0          # sample counter
-        self._fade_in   = 0.0        # 0→1 smooth transition
-        self._target_mood = "Focus"
-        self._crossfade  = 1.0       # 1.0 = fully settled
-
-        # Brown/pink noise state
-        self._brown_state = 0.0
-        self._pink_b = np.zeros(7)
-
-        self._stream = None
-
-    # ── public API ──────────────────────────────
-
-    def set_mood(self, mood):
-        with self._lock:
-            self._target_mood = mood
-            self._crossfade   = 0.0  # triggers fade
-
-    def set_volume(self, v):   self.volume    = max(0.0, min(1.0, v))
-    def set_intensity(self, v): self.intensity = max(0.0, min(1.0, v))
-
+        self.layers=[DroneLayer(),ShimmerLayer(),RainLayer(),WindLayer(),PulseLayer(),BellLayer(),NoiseLayer()]
+        self.master_vol=0.5; self.reverb=SimpleReverb()
+        self._playing=False; self._stream=None; self._lock=threading.Lock()
+    def set_master(self,v): self.master_vol=max(0.0,min(1.0,v))
+    def set_reverb(self,v): self.reverb.set_wet(v)
     def start(self):
-        if self._playing:
-            return
-        self._playing = True
-        self._fade_in = 0.0
-        self._stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE,
-            channels=2,
-            blocksize=BLOCK_SIZE,
-            dtype='float32',
-            callback=self._callback,
-        )
+        if self._playing: return
+        self._playing=True
+        self._stream=sd.OutputStream(samplerate=SR,channels=2,blocksize=BLOCK,dtype='float32',callback=self._cb)
         self._stream.start()
-
     def stop(self):
-        self._playing = False
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-    # ── internal synthesis ───────────────────────
-
-    def _callback(self, outdata, frames, time_info, status):
+        self._playing=False
+        if self._stream: self._stream.stop(); self._stream.close(); self._stream=None
+    def _cb(self,outdata,frames,t,s):
+        mix=np.zeros(frames,dtype=np.float64)
         with self._lock:
-            mood_cfg  = self.MOODS[self.mood]
-            t_cfg     = self.MOODS[self._target_mood]
+            for l in self.layers: mix+=l.tick(frames)
+        mix=self.reverb.process(mix)*self.master_vol
+        mix=np.tanh(mix*1.1)/1.1
+        sp=7; right=np.concatenate([mix[sp:],mix[:sp]])
+        outdata[:,0]=mix.astype(np.float32); outdata[:,1]=right.astype(np.float32)
 
-        t = np.arange(frames) + self._t
-        self._t += frames
+# ── UI ────────────────────────────────────────────────────────────────────────
 
-        # Smooth fade-in on first start
-        if self._fade_in < 1.0:
-            self._fade_in = min(1.0, self._fade_in + frames / (SAMPLE_RATE * 1.5))
-
-        # Crossfade between moods
-        if self._crossfade < 1.0:
-            self._crossfade = min(1.0, self._crossfade + frames / (SAMPLE_RATE * 2.0))
-            if self._crossfade >= 1.0:
-                with self._lock:
-                    self.mood = self._target_mood
-                    mood_cfg  = self.MOODS[self.mood]
-
-        blend = self._crossfade  # 0=old mood, 1=new mood
-
-        sig_old = self._synthesize(t, mood_cfg, frames)
-        sig_new = self._synthesize(t, t_cfg,    frames)
-        signal  = sig_old * (1 - blend) + sig_new * blend
-
-        # Master volume + fade-in envelope
-        signal *= self.volume * self._fade_in
-
-        # Stereo: slight spread
-        left  = signal * 0.95
-        right = signal * 1.05
-        outdata[:, 0] = left.astype(np.float32)
-        outdata[:, 1] = right.astype(np.float32)
-
-    def _synthesize(self, t, cfg, frames):
-        sr  = SAMPLE_RATE
-        sig = np.zeros(frames)
-        freq = cfg["base_freq"]
-
-        # ── Harmonics (drone / pad) ──────────────
-        for h, amp in zip(cfg["harmonics"], cfg["harmonic_amps"]):
-            # Very slow LFO per harmonic for organic feel
-            lfo_rate = 0.07 + h * 0.03
-            lfo = 1.0 + 0.06 * np.sin(2 * np.pi * lfo_rate * t / sr)
-            sig += amp * lfo * np.sin(2 * np.pi * freq * h * t / sr)
-
-        # Normalise harmonics portion
-        sig /= (sum(cfg["harmonic_amps"]) + 1e-9)
-        sig *= (0.6 + 0.4 * self.intensity)
-
-        # ── Shimmer (Dreamy mode) ────────────────
-        if cfg["shimmer"]:
-            shimmer_freq = freq * 8
-            depth = 0.18 * self.intensity
-            lfo_s = np.sin(2 * np.pi * 0.3 * t / sr)
-            sig  += depth * lfo_s * np.sin(2 * np.pi * shimmer_freq * t / sr)
-
-        # ── Pulse (Rain mode) ────────────────────
-        if cfg["pulse"]:
-            pulse_rate = 0.5  # Hz
-            pulse = (np.sin(2 * np.pi * pulse_rate * t / sr) * 0.5 + 0.5) ** 3
-            sig  += 0.15 * self.intensity * pulse * np.sin(2 * np.pi * freq * 1.5 * t / sr)
-
-        # ── Noise layer ──────────────────────────
-        noise_raw = np.random.randn(frames).astype(np.float64)
-
-        if cfg["noise_color"] == "brown":
-            noise = self._brown_noise(noise_raw)
-        elif cfg["noise_color"] == "pink":
-            noise = self._pink_noise(noise_raw)
-        else:
-            noise = noise_raw * 0.3
-
-        noise_level = cfg["noise_level"] * (0.5 + 0.5 * self.intensity)
-        sig += noise_level * noise
-
-        return sig
-
-    def _brown_noise(self, white):
-        out = np.empty_like(white)
-        s   = self._brown_state
-        for i, w in enumerate(white):
-            s = (s + 0.02 * w) / 1.02
-            out[i] = s
-        self._brown_state = s
-        peak = np.max(np.abs(out)) + 1e-9
-        return out / peak * 0.5
-
-    def _pink_noise(self, white):
-        b = self._pink_b
-        out = np.empty_like(white)
-        for i, w in enumerate(white):
-            b[0] = 0.99886*b[0] + w*0.0555179
-            b[1] = 0.99332*b[1] + w*0.0750759
-            b[2] = 0.96900*b[2] + w*0.1538520
-            b[3] = 0.86650*b[3] + w*0.3104856
-            b[4] = 0.55000*b[4] + w*0.5329522
-            b[5] = -0.7616*b[5] - w*0.0168980
-            out[i] = (b[0]+b[1]+b[2]+b[3]+b[4]+b[5] + b[6] + w*0.5362) * 0.11
-            b[6] = w * 0.115926
-        self._pink_b = b
-        return out
-
-
-# ─────────────────────────────────────────────
-#  VISUALIZER WIDGET
-# ─────────────────────────────────────────────
-
-class VisualizerWidget(QWidget):
-    """Soft pulsing orb that reacts to mood."""
-
-    MOOD_COLORS = {
-        "Focus":  [(0.6, 0.85, 1.0),  (0.3, 0.55, 0.9)],   # cool blue
-        "Dreamy": [(0.85, 0.65, 1.0), (0.55, 0.3,  0.9)],  # lavender
-        "Rain":   [(0.5, 0.85, 0.75), (0.2, 0.6,  0.55)],  # teal-green
-    }
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(220, 220)
-        self._mood    = "Focus"
-        self._phase   = 0.0
-        self._playing = False
-
-        self._timer = QTimer()
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(33)  # ~30fps
-
-    def set_mood(self, mood):
-        self._mood = mood
-        self.update()
-
-    def set_playing(self, playing):
-        self._playing = playing
-
-    def _tick(self):
-        if self._playing:
-            self._phase += 0.025
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-
-        w, h   = self.width(), self.height()
-        cx, cy = w / 2, h / 2
-        r_base = min(w, h) * 0.33
-
-        colors = self.MOOD_COLORS[self._mood]
-        c1 = QColor.fromRgbF(*colors[0], 0.85)
-        c2 = QColor.fromRgbF(*colors[1], 0.4)
-
-        # Outer glow rings (slow pulse)
-        for i in range(3):
-            pulse = math.sin(self._phase + i * 0.8) * 0.5 + 0.5
-            r = r_base * (1.05 + i * 0.18 + pulse * 0.12)
-            alpha = 0.12 - i * 0.035
-            glow = QColor.fromRgbF(*colors[1], alpha)
-            p.setBrush(QBrush(glow))
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
-
-        # Core orb — radial gradient
-        pulse_core = math.sin(self._phase * 1.1) * 0.5 + 0.5
-        r_core = r_base * (0.85 + pulse_core * 0.1)
-
-        grad = QRadialGradient(cx, cy, r_core)
-        grad.setColorAt(0.0, QColor.fromRgbF(*colors[0], 0.95))
-        grad.setColorAt(0.5, QColor.fromRgbF(*colors[1], 0.75))
-        grad.setColorAt(1.0, QColor.fromRgbF(*colors[1], 0.0))
-        p.setBrush(QBrush(grad))
-        p.setPen(Qt.NoPen)
-        p.drawEllipse(int(cx - r_core), int(cy - r_core), int(r_core * 2), int(r_core * 2))
-
-        # Inner bright spot
-        r_spot = r_base * 0.28
-        spot = QRadialGradient(cx - r_base*0.12, cy - r_base*0.12, r_spot)
-        spot.setColorAt(0.0, QColor.fromRgbF(1, 1, 1, 0.55))
-        spot.setColorAt(1.0, QColor.fromRgbF(1, 1, 1, 0.0))
-        p.setBrush(QBrush(spot))
-        p.drawEllipse(int(cx - r_spot*1.3), int(cy - r_spot*1.3), int(r_spot*2.6), int(r_spot*2.6))
-
-        p.end()
-
-
-# ─────────────────────────────────────────────
-#  MAIN WINDOW
-# ─────────────────────────────────────────────
-
-STYLE = """
-QMainWindow, QWidget#root {
-    background-color: #0d0f14;
-}
-QWidget {
-    background-color: transparent;
-    color: #c8d4e8;
-    font-family: 'Segoe UI', sans-serif;
-}
-QPushButton#moodBtn {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 18px;
-    padding: 8px 20px;
-    font-size: 13px;
-    color: #8fa4c8;
-    letter-spacing: 1px;
-}
-QPushButton#moodBtn:hover {
-    background: rgba(255,255,255,0.09);
-    color: #c8d4e8;
-}
-QPushButton#moodBtn[active="true"] {
-    background: rgba(130,170,255,0.15);
-    border: 1px solid rgba(130,170,255,0.4);
-    color: #aac4ff;
-}
-QPushButton#playBtn {
-    background: rgba(130,170,255,0.12);
-    border: 1px solid rgba(130,170,255,0.25);
-    border-radius: 28px;
-    font-size: 22px;
-    color: #aac4ff;
-    min-width: 56px;
-    min-height: 56px;
-    max-width: 56px;
-    max-height: 56px;
-}
-QPushButton#playBtn:hover {
-    background: rgba(130,170,255,0.22);
-}
-QSlider::groove:horizontal {
-    height: 3px;
-    background: rgba(255,255,255,0.1);
-    border-radius: 2px;
-}
-QSlider::handle:horizontal {
-    background: #7aa2f7;
-    border: none;
-    width: 14px;
-    height: 14px;
-    margin: -6px 0;
-    border-radius: 7px;
-}
-QSlider::sub-page:horizontal {
-    background: rgba(122,162,247,0.55);
-    border-radius: 2px;
-}
-QLabel#title {
-    font-size: 22px;
-    font-weight: 300;
-    letter-spacing: 6px;
-    color: #dce8ff;
-}
-QLabel#desc {
-    font-size: 11px;
-    letter-spacing: 2px;
-    color: rgba(140,160,200,0.55);
-}
-QLabel#sliderLabel {
-    font-size: 10px;
-    letter-spacing: 2px;
-    color: rgba(140,160,200,0.45);
-    text-transform: uppercase;
-}
-QFrame#divider {
-    background: rgba(255,255,255,0.06);
-    max-height: 1px;
-}
+STYLE="""
+QMainWindow,QWidget#root{background:#0c0e13;}
+QWidget{background:transparent;color:#c0cce0;font-family:'Segoe UI',sans-serif;}
+QPushButton#toggleBtn{border-radius:16px;border:1.5px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);font-size:18px;min-width:36px;max-width:36px;min-height:36px;max-height:36px;}
+QPushButton#toggleBtn:hover{background:rgba(255,255,255,0.09);}
+QPushButton#toggleBtn[on="true"]{border:1.5px solid rgba(180,210,255,0.45);background:rgba(120,170,255,0.18);}
+QPushButton#playBtn{border-radius:26px;border:1.5px solid rgba(140,180,255,0.3);background:rgba(120,160,255,0.12);font-size:20px;color:#aac0ff;min-width:52px;max-width:52px;min-height:52px;max-height:52px;}
+QPushButton#playBtn:hover{background:rgba(120,160,255,0.22);}
+QLabel#layerName{font-size:11px;letter-spacing:1.5px;color:rgba(190,205,230,0.75);}
+QLabel#secLbl{font-size:9px;letter-spacing:3px;color:rgba(130,150,190,0.4);}
+QLabel#title{font-size:20px;font-weight:300;letter-spacing:8px;color:#d8e8ff;}
+QSlider::groove:horizontal{height:2px;background:rgba(255,255,255,0.08);border-radius:1px;}
+QSlider::handle:horizontal{background:#7090d0;border:none;width:12px;height:12px;margin:-5px 0;border-radius:6px;}
+QSlider::sub-page:horizontal{background:rgba(100,140,220,0.5);border-radius:1px;}
+QFrame#div{background:rgba(255,255,255,0.05);max-height:1px;}
+QFrame#card{background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.06);border-radius:12px;}
 """
+
+class LayerStrip(QFrame):
+    def __init__(self,layer,parent=None):
+        super().__init__(parent); self.layer=layer; self.setObjectName("card")
+        row=QHBoxLayout(self); row.setContentsMargins(14,9,14,9); row.setSpacing(12)
+        r,g,b=[int(c*255) for c in layer.color]
+        dot=QLabel("●"); dot.setStyleSheet(f"color:rgb({r},{g},{b});font-size:13px;"); dot.setFixedWidth(14)
+        row.addWidget(dot)
+        nm=QLabel(layer.name.upper()); nm.setObjectName("layerName"); nm.setFixedWidth(90)
+        row.addWidget(nm)
+        sl=QSlider(Qt.Horizontal); sl.setRange(0,100); sl.setValue(int(layer.volume*100))
+        sl.valueChanged.connect(lambda v:layer.set_volume(v/100)); row.addWidget(sl,stretch=1)
+        self.btn=QPushButton("◎"); self.btn.setObjectName("toggleBtn"); self.btn.setProperty("on",False); self.btn.setCheckable(True)
+        self.btn.clicked.connect(self._tog); row.addWidget(self.btn)
+    def _tog(self,checked):
+        self.layer.enable(checked); self.btn.setProperty("on",checked)
+        self.btn.setText("◉" if checked else "◎")
+        self.btn.style().unpolish(self.btn); self.btn.style().polish(self.btn)
+
+class Orb(QWidget):
+    def __init__(self,engine,parent=None):
+        super().__init__(parent); self.engine=engine; self._ph=0.0; self.setFixedSize(150,150)
+        t=QTimer(self); t.timeout.connect(self._tick); t.start(40)
+    def _tick(self): self._ph+=0.018; self.update()
+    def paintEvent(self,event):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        cx,cy=self.width()/2,self.height()/2; r=48
+        active=[l for l in self.engine.layers if l.enabled]
+        if active:
+            cr=sum(l.color[0] for l in active)/len(active)
+            cg=sum(l.color[1] for l in active)/len(active)
+            cb=sum(l.color[2] for l in active)/len(active)
+        else: cr,cg,cb=0.28,0.38,0.58
+        pulse=math.sin(self._ph)*0.5+0.5
+        for i in range(4,0,-1):
+            gr=r*(1.0+i*0.22+pulse*0.08); a=max(0,0.055-i*0.01)
+            p.setBrush(QBrush(QColor.fromRgbF(cr,cg,cb,a))); p.setPen(Qt.NoPen)
+            p.drawEllipse(int(cx-gr),int(cy-gr),int(gr*2),int(gr*2))
+        rc=r*(0.88+pulse*0.10)
+        g=QRadialGradient(cx,cy,rc)
+        g.setColorAt(0.0,QColor.fromRgbF(min(1,cr+0.3),min(1,cg+0.25),min(1,cb+0.2),0.95))
+        g.setColorAt(0.6,QColor.fromRgbF(cr,cg,cb,0.75))
+        g.setColorAt(1.0,QColor.fromRgbF(cr*0.6,cg*0.6,cb*0.6,0.0))
+        p.setBrush(QBrush(g)); p.drawEllipse(int(cx-rc),int(cy-rc),int(rc*2),int(rc*2))
+        rs=r*0.25; sx,sy=cx-r*0.16,cy-r*0.16
+        sg=QRadialGradient(sx,sy,rs); sg.setColorAt(0,QColor.fromRgbF(1,1,1,0.5)); sg.setColorAt(1,QColor.fromRgbF(1,1,1,0))
+        p.setBrush(QBrush(sg)); p.drawEllipse(int(sx-rs),int(sy-rs),int(rs*2),int(rs*2)); p.end()
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.engine   = AudioEngine()
-        self.playing  = False
-        self.cur_mood = "Focus"
+        self.engine=AudioEngine(); self.playing=False
+        self.setWindowTitle("ambient"); self.setFixedWidth(420); self.setStyleSheet(STYLE)
+        ico=os.path.join(os.path.dirname(os.path.abspath(__file__)),"ambient.ico")
+        if os.path.exists(ico): self.setWindowIcon(QIcon(ico))
 
-        self.setWindowTitle("ambient")
-        self.setFixedSize(380, 580)
-        self.setStyleSheet(STYLE)
+        root=QWidget(); root.setObjectName("root"); self.setCentralWidget(root)
+        main=QVBoxLayout(root); main.setContentsMargins(24,26,24,24); main.setSpacing(0)
 
-        # Window icon
-        from PySide6.QtGui import QIcon
-        _ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ambient.ico")
-        if os.path.exists(_ico):
-            self.setWindowIcon(QIcon(_ico))
+        # Header
+        top=QHBoxLayout(); top.setSpacing(0)
+        left=QVBoxLayout(); left.setSpacing(4)
+        t=QLabel("A M B I E N T"); t.setObjectName("title"); left.addWidget(t)
+        s=QLabel("GENERATIVE SOUNDSCAPE"); s.setObjectName("secLbl"); left.addWidget(s)
+        left.addSpacing(12)
+        self.play_btn=QPushButton("▶"); self.play_btn.setObjectName("playBtn")
+        self.play_btn.clicked.connect(self.toggle_play); left.addWidget(self.play_btn)
+        left.addStretch()
+        top.addLayout(left); top.addStretch()
+        self.orb=Orb(self.engine); top.addWidget(self.orb,alignment=Qt.AlignTop)
+        main.addLayout(top); main.addSpacing(18)
 
-        root = QWidget()
-        root.setObjectName("root")
-        self.setCentralWidget(root)
+        div=QFrame(); div.setObjectName("div"); main.addWidget(div); main.addSpacing(14)
 
-        lay = QVBoxLayout(root)
-        lay.setContentsMargins(30, 36, 30, 36)
-        lay.setSpacing(0)
+        lbl=QLabel("LAYERS"); lbl.setObjectName("secLbl"); main.addWidget(lbl); main.addSpacing(8)
 
-        # ── Title ──────────────────────────────
-        title = QLabel("A M B I E N T")
-        title.setObjectName("title")
-        title.setAlignment(Qt.AlignCenter)
-        lay.addWidget(title)
+        for layer in self.engine.layers:
+            main.addWidget(LayerStrip(layer)); main.addSpacing(5)
 
-        lay.addSpacing(4)
-        self.desc_label = QLabel(AudioEngine.MOODS["Focus"]["desc"])
-        self.desc_label.setObjectName("desc")
-        self.desc_label.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.desc_label)
+        main.addSpacing(12)
+        div2=QFrame(); div2.setObjectName("div"); main.addWidget(div2); main.addSpacing(14)
+        lbl2=QLabel("MASTER"); lbl2.setObjectName("secLbl"); main.addWidget(lbl2); main.addSpacing(10)
 
-        lay.addSpacing(28)
+        def slider_row(label,init,cb):
+            row=QHBoxLayout(); row.setSpacing(12)
+            l=QLabel(label); l.setObjectName("secLbl")
+            l.setStyleSheet("font-size:10px;letter-spacing:2px;color:rgba(130,150,190,0.5);")
+            l.setFixedWidth(68); row.addWidget(l)
+            sl=QSlider(Qt.Horizontal); sl.setRange(0,100); sl.setValue(init)
+            sl.valueChanged.connect(cb); row.addWidget(sl); return row
 
-        # ── Visualizer ─────────────────────────
-        self.viz = VisualizerWidget()
-        lay.addWidget(self.viz, alignment=Qt.AlignCenter)
-
-        lay.addSpacing(28)
-
-        # ── Mood buttons ───────────────────────
-        mood_row = QHBoxLayout()
-        mood_row.setSpacing(10)
-        self.mood_btns = {}
-        for mood in ["Focus", "Dreamy", "Rain"]:
-            btn = QPushButton(mood)
-            btn.setObjectName("moodBtn")
-            btn.setProperty("active", mood == self.cur_mood)
-            btn.clicked.connect(lambda _, m=mood: self.set_mood(m))
-            mood_row.addWidget(btn)
-            self.mood_btns[mood] = btn
-        lay.addLayout(mood_row)
-
-        lay.addSpacing(28)
-
-        # ── Divider ────────────────────────────
-        div = QFrame()
-        div.setObjectName("divider")
-        lay.addWidget(div)
-
-        lay.addSpacing(22)
-
-        # ── Volume slider ──────────────────────
-        vol_lbl = QLabel("VOLUME")
-        vol_lbl.setObjectName("sliderLabel")
-        lay.addWidget(vol_lbl)
-        lay.addSpacing(8)
-
-        self.vol_slider = QSlider(Qt.Horizontal)
-        self.vol_slider.setRange(0, 100)
-        self.vol_slider.setValue(35)
-        self.vol_slider.valueChanged.connect(
-            lambda v: self.engine.set_volume(v / 100))
-        lay.addWidget(self.vol_slider)
-
-        lay.addSpacing(18)
-
-        # ── Intensity slider ───────────────────
-        int_lbl = QLabel("INTENSITY")
-        int_lbl.setObjectName("sliderLabel")
-        lay.addWidget(int_lbl)
-        lay.addSpacing(8)
-
-        self.int_slider = QSlider(Qt.Horizontal)
-        self.int_slider.setRange(0, 100)
-        self.int_slider.setValue(50)
-        self.int_slider.valueChanged.connect(
-            lambda v: self.engine.set_intensity(v / 100))
-        lay.addWidget(self.int_slider)
-
-        lay.addSpacing(28)
-
-        # ── Play button ────────────────────────
-        self.play_btn = QPushButton("▶")
-        self.play_btn.setObjectName("playBtn")
-        self.play_btn.clicked.connect(self.toggle_play)
-        lay.addWidget(self.play_btn, alignment=Qt.AlignCenter)
-
-        lay.addStretch()
-
-    def set_mood(self, mood):
-        self.cur_mood = mood
-        self.engine.set_mood(mood)
-        self.viz.set_mood(mood)
-        self.desc_label.setText(AudioEngine.MOODS[mood]["desc"])
-
-        for name, btn in self.mood_btns.items():
-            btn.setProperty("active", name == mood)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+        main.addLayout(slider_row("VOLUME",50,lambda v:self.engine.set_master(v/100)))
+        main.addSpacing(10)
+        main.addLayout(slider_row("REVERB",30,lambda v:self.engine.set_reverb(v/100*0.55)))
+        main.addStretch()
 
     def toggle_play(self):
-        if self.playing:
-            self.engine.stop()
-            self.play_btn.setText("▶")
-            self.viz.set_playing(False)
-        else:
-            self.engine.start()
-            self.play_btn.setText("■")
-            self.viz.set_playing(True)
-        self.playing = not self.playing
+        if self.playing: self.engine.stop(); self.play_btn.setText("▶")
+        else: self.engine.start(); self.play_btn.setText("■")
+        self.playing=not self.playing
 
-    def closeEvent(self, event):
-        self.engine.stop()
-        super().closeEvent(event)
+    def closeEvent(self,event):
+        self.engine.stop(); super().closeEvent(event)
 
-
-# ─────────────────────────────────────────────
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setApplicationName("ambient")
-    win = MainWindow()
-    win.show()
+if __name__=="__main__":
+    app=QApplication(sys.argv)
+    win=MainWindow(); win.show()
     sys.exit(app.exec())
