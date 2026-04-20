@@ -1,190 +1,512 @@
-"""
-email_sender.py – Opens the system default mail client with the given file
-already attached.  Supports Windows (Outlook via COM) and Linux
-(xdg-email → Evolution / R7 Organiser / any XDG-compliant client).
-"""
-
-import os
 import sys
-import subprocess
-from urllib.parse import quote
+import numpy as np
+import sounddevice as sd
+import threading
+import time
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QSlider, QLabel, QFrame
+)
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPropertyAnimation, QEasingCurve, Property
+from PySide6.QtGui import QFont, QColor, QPainter, QRadialGradient, QLinearGradient, QPen, QBrush, QPainterPath
+import math
 
-from PySide6.QtWidgets import QMessageBox
+# ─────────────────────────────────────────────
+#  AUDIO ENGINE
+# ─────────────────────────────────────────────
 
+SAMPLE_RATE = 44100
+BLOCK_SIZE  = 2048
 
-class EmailSender:
-    """
-    Opens the platform's default mail client with *file_path* pre-attached.
+class AudioEngine:
+    """Generates ambient sound in real time using numpy."""
 
-    Usage:
-        ok = EmailSender.send(parent_widget, file_path)
-    """
+    MOODS = {
+        "Focus": {
+            "desc": "steady warmth, no distractions",
+            "base_freq": 55.0,       # A1 — deep, grounding
+            "harmonics": [1, 2, 3],
+            "harmonic_amps": [1.0, 0.4, 0.15],
+            "noise_color": "brown",
+            "noise_level": 0.04,
+            "pulse": False,
+            "shimmer": False,
+        },
+        "Dreamy": {
+            "desc": "soft pads, evolving shimmer",
+            "base_freq": 146.83,     # D3 — airy, luminous
+            "harmonics": [1, 1.5, 2, 3, 4],
+            "harmonic_amps": [1.0, 0.6, 0.35, 0.2, 0.08],
+            "noise_color": "pink",
+            "noise_level": 0.02,
+            "pulse": False,
+            "shimmer": True,
+        },
+        "Rain": {
+            "desc": "textured noise, gentle pulse",
+            "base_freq": 82.41,      # E2 — warm low hum
+            "harmonics": [1, 2],
+            "harmonic_amps": [1.0, 0.3],
+            "noise_color": "white",
+            "noise_level": 0.18,
+            "pulse": True,
+            "shimmer": False,
+        },
+    }
 
-    @staticmethod
-    def send(parent, file_path: str) -> bool:
-        """
-        Try to open a new mail draft with *file_path* attached.
-        Returns True if the client was launched without an obvious error.
-        Shows an error dialog and returns False on failure.
-        """
-        if not os.path.isfile(file_path):
-            QMessageBox.warning(parent, "Ошибка", f"Файл не найден:\n{file_path}")
-            return False
+    def __init__(self):
+        self.mood       = "Focus"
+        self.volume     = 0.35
+        self.intensity  = 0.5       # 0..1 — affects harmonic richness & noise
+        self._playing   = False
+        self._lock      = threading.Lock()
+        self._phase     = 0.0
+        self._t         = 0          # sample counter
+        self._fade_in   = 0.0        # 0→1 smooth transition
+        self._target_mood = "Focus"
+        self._crossfade  = 1.0       # 1.0 = fully settled
 
-        subject = os.path.basename(file_path)
-        body    = f"В приложении PDF документ: {subject}"
+        # Brown/pink noise state
+        self._brown_state = 0.0
+        self._pink_b = np.zeros(7)
 
-        if sys.platform == "win32":
-            return EmailSender._send_windows(parent, file_path, subject, body)
+        self._stream = None
+
+    # ── public API ──────────────────────────────
+
+    def set_mood(self, mood):
+        with self._lock:
+            self._target_mood = mood
+            self._crossfade   = 0.0  # triggers fade
+
+    def set_volume(self, v):   self.volume    = max(0.0, min(1.0, v))
+    def set_intensity(self, v): self.intensity = max(0.0, min(1.0, v))
+
+    def start(self):
+        if self._playing:
+            return
+        self._playing = True
+        self._fade_in = 0.0
+        self._stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            channels=2,
+            blocksize=BLOCK_SIZE,
+            dtype='float32',
+            callback=self._callback,
+        )
+        self._stream.start()
+
+    def stop(self):
+        self._playing = False
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+    # ── internal synthesis ───────────────────────
+
+    def _callback(self, outdata, frames, time_info, status):
+        with self._lock:
+            mood_cfg  = self.MOODS[self.mood]
+            t_cfg     = self.MOODS[self._target_mood]
+
+        t = np.arange(frames) + self._t
+        self._t += frames
+
+        # Smooth fade-in on first start
+        if self._fade_in < 1.0:
+            self._fade_in = min(1.0, self._fade_in + frames / (SAMPLE_RATE * 1.5))
+
+        # Crossfade between moods
+        if self._crossfade < 1.0:
+            self._crossfade = min(1.0, self._crossfade + frames / (SAMPLE_RATE * 2.0))
+            if self._crossfade >= 1.0:
+                with self._lock:
+                    self.mood = self._target_mood
+                    mood_cfg  = self.MOODS[self.mood]
+
+        blend = self._crossfade  # 0=old mood, 1=new mood
+
+        sig_old = self._synthesize(t, mood_cfg, frames)
+        sig_new = self._synthesize(t, t_cfg,    frames)
+        signal  = sig_old * (1 - blend) + sig_new * blend
+
+        # Master volume + fade-in envelope
+        signal *= self.volume * self._fade_in
+
+        # Stereo: slight spread
+        left  = signal * 0.95
+        right = signal * 1.05
+        outdata[:, 0] = left.astype(np.float32)
+        outdata[:, 1] = right.astype(np.float32)
+
+    def _synthesize(self, t, cfg, frames):
+        sr  = SAMPLE_RATE
+        sig = np.zeros(frames)
+        freq = cfg["base_freq"]
+
+        # ── Harmonics (drone / pad) ──────────────
+        for h, amp in zip(cfg["harmonics"], cfg["harmonic_amps"]):
+            # Very slow LFO per harmonic for organic feel
+            lfo_rate = 0.07 + h * 0.03
+            lfo = 1.0 + 0.06 * np.sin(2 * np.pi * lfo_rate * t / sr)
+            sig += amp * lfo * np.sin(2 * np.pi * freq * h * t / sr)
+
+        # Normalise harmonics portion
+        sig /= (sum(cfg["harmonic_amps"]) + 1e-9)
+        sig *= (0.6 + 0.4 * self.intensity)
+
+        # ── Shimmer (Dreamy mode) ────────────────
+        if cfg["shimmer"]:
+            shimmer_freq = freq * 8
+            depth = 0.18 * self.intensity
+            lfo_s = np.sin(2 * np.pi * 0.3 * t / sr)
+            sig  += depth * lfo_s * np.sin(2 * np.pi * shimmer_freq * t / sr)
+
+        # ── Pulse (Rain mode) ────────────────────
+        if cfg["pulse"]:
+            pulse_rate = 0.5  # Hz
+            pulse = (np.sin(2 * np.pi * pulse_rate * t / sr) * 0.5 + 0.5) ** 3
+            sig  += 0.15 * self.intensity * pulse * np.sin(2 * np.pi * freq * 1.5 * t / sr)
+
+        # ── Noise layer ──────────────────────────
+        noise_raw = np.random.randn(frames).astype(np.float64)
+
+        if cfg["noise_color"] == "brown":
+            noise = self._brown_noise(noise_raw)
+        elif cfg["noise_color"] == "pink":
+            noise = self._pink_noise(noise_raw)
         else:
-            return EmailSender._send_linux(parent, file_path, subject, body)
+            noise = noise_raw * 0.3
 
-    # ------------------------------------------------------------------ #
-    #  Windows                                                             #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _send_windows(parent, file_path: str, subject: str, body: str) -> bool:
-        """
-        Primary:  Outlook COM automation — opens a draft, attaches the file,
-                  and displays the compose window.  User can edit & send.
-        Fallback: xdg-email / webbrowser mailto: (no attachment possible on
-                  non-Outlook clients, so we warn the user).
-        """
-        try:
-            import win32com.client as win32
-            ol = win32.Dispatch("Outlook.Application")
-            mail = ol.CreateItem(0)          # 0 = olMailItem
-            mail.Subject = subject
-            mail.Body    = body
-            mail.Attachments.Add(file_path)
-            mail.Display()                   # show compose window; don't auto-send
-            return True
-        except Exception as e:
-            print(f"[EmailSender] Outlook COM failed: {e}")
+        noise_level = cfg["noise_level"] * (0.5 + 0.5 * self.intensity)
+        sig += noise_level * noise
 
-        # Outlook unavailable — fall back to mailto: (no attachment)
-        return EmailSender._send_mailto_fallback(parent, file_path, subject, body)
+        return sig
 
-    # ------------------------------------------------------------------ #
-    #  Linux                                                               #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _send_linux(parent, file_path: str, subject: str, body: str) -> bool:
-        """
-        Try strategies in order, stop at the first success.
+    def _brown_noise(self, white):
+        out = np.empty_like(white)
+        s   = self._brown_state
+        for i, w in enumerate(white):
+            s = (s + 0.02 * w) / 1.02
+            out[i] = s
+        self._brown_state = s
+        peak = np.max(np.abs(out)) + 1e-9
+        return out / peak * 0.5
 
-        1. xdg-email --attach  (freedesktop standard; works with Evolution,
-                                Thunderbird, R7 Organiser when registered)
-        2. evolution --component=mail mailto:  with attach= in the URI
-        3. R7 Organiser direct call (same mailto URI style)
-        4. mailto: fallback via xdg-open / webbrowser (no attachment)
-        """
+    def _pink_noise(self, white):
+        b = self._pink_b
+        out = np.empty_like(white)
+        for i, w in enumerate(white):
+            b[0] = 0.99886*b[0] + w*0.0555179
+            b[1] = 0.99332*b[1] + w*0.0750759
+            b[2] = 0.96900*b[2] + w*0.1538520
+            b[3] = 0.86650*b[3] + w*0.3104856
+            b[4] = 0.55000*b[4] + w*0.5329522
+            b[5] = -0.7616*b[5] - w*0.0168980
+            out[i] = (b[0]+b[1]+b[2]+b[3]+b[4]+b[5] + b[6] + w*0.5362) * 0.11
+            b[6] = w * 0.115926
+        self._pink_b = b
+        return out
 
-        # 1 ── xdg-email (best option: handles attachment portably) ──────
-        if EmailSender._which("xdg-email"):
-            try:
-                cmd = [
-                    "xdg-email",
-                    "--subject", subject,
-                    "--body",    body,
-                    "--attach",  file_path,
-                ]
-                result = subprocess.run(
-                    cmd,
-                    timeout=10,
-                    start_new_session=True,
-                )
-                if result.returncode == 0:
-                    return True
-                print(f"[EmailSender] xdg-email exited with code {result.returncode}")
-            except Exception as e:
-                print(f"[EmailSender] xdg-email failed: {e}")
 
-        # 2 ── Evolution directly ─────────────────────────────────────────
-        evolution = EmailSender._find_binary(
-            ["evolution", "/usr/bin/evolution", "/usr/local/bin/evolution"]
-        )
-        if evolution:
-            try:
-                # Evolution understands attach= inside the mailto URI
-                uri = (
-                    f"mailto:?subject={quote(subject)}"
-                    f"&body={quote(body)}"
-                    f"&attach={quote('file://' + file_path)}"
-                )
-                subprocess.Popen(
-                    [evolution, "--component=mail", uri],
-                    start_new_session=True,
-                )
-                return True
-            except Exception as e:
-                print(f"[EmailSender] Evolution failed: {e}")
+# ─────────────────────────────────────────────
+#  VISUALIZER WIDGET
+# ─────────────────────────────────────────────
 
-        # 3 ── R7 Organiser ───────────────────────────────────────────────
-        r7 = EmailSender._find_binary([
-            "/opt/r7-office/organizer/r7organizer",
-            "/opt/r7office/organizer/r7organizer",
-        ])
-        if r7:
-            try:
-                uri = (
-                    f"mailto:?subject={quote(subject)}"
-                    f"&body={quote(body)}"
-                    f"&attach={quote('file://' + file_path)}"
-                )
-                subprocess.Popen([r7, uri], start_new_session=True)
-                return True
-            except Exception as e:
-                print(f"[EmailSender] R7 Organiser failed: {e}")
+class VisualizerWidget(QWidget):
+    """Soft pulsing orb that reacts to mood."""
 
-        # 4 ── mailto: fallback (no attachment) ───────────────────────────
-        return EmailSender._send_mailto_fallback(parent, file_path, subject, body)
+    MOOD_COLORS = {
+        "Focus":  [(0.6, 0.85, 1.0),  (0.3, 0.55, 0.9)],   # cool blue
+        "Dreamy": [(0.85, 0.65, 1.0), (0.55, 0.3,  0.9)],  # lavender
+        "Rain":   [(0.5, 0.85, 0.75), (0.2, 0.6,  0.55)],  # teal-green
+    }
 
-    # ------------------------------------------------------------------ #
-    #  Fallback – mailto: without attachment                               #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _send_mailto_fallback(parent, file_path: str, subject: str, body: str) -> bool:
-        """
-        Opens a bare mailto: link (no attachment support).
-        Informs the user where the file is so they can attach it manually.
-        """
-        import webbrowser
-        mailto = f"mailto:?subject={quote(subject)}&body={quote(body)}"
-        try:
-            webbrowser.open(mailto)
-        except Exception as e:
-            print(f"[EmailSender] webbrowser.open failed: {e}")
-            QMessageBox.critical(
-                parent,
-                "Ошибка",
-                f"Не удалось открыть почтовый клиент.\n\n"
-                f"Прикрепите файл вручную:\n{file_path}",
-            )
-            return False
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(220, 220)
+        self._mood    = "Focus"
+        self._phase   = 0.0
+        self._playing = False
 
-        # mailto opened, but we couldn't attach — tell the user
-        QMessageBox.information(
-            parent,
-            "Вложение к письму",
-            f"Почтовый клиент открыт, но файл не удалось прикрепить автоматически.\n\n"
-            f"Прикрепите файл вручную:\n{file_path}",
-        )
-        return True
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(33)  # ~30fps
 
-    # ------------------------------------------------------------------ #
-    #  Helpers                                                             #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _which(name: str) -> bool:
-        """True if *name* is found on PATH."""
-        import shutil
-        return shutil.which(name) is not None
+    def set_mood(self, mood):
+        self._mood = mood
+        self.update()
 
-    @staticmethod
-    def _find_binary(candidates: list) -> str | None:
-        """Return the first existing path from *candidates*, or None."""
-        for path in candidates:
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                return path
-        return None
+    def set_playing(self, playing):
+        self._playing = playing
+
+    def _tick(self):
+        if self._playing:
+            self._phase += 0.025
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        w, h   = self.width(), self.height()
+        cx, cy = w / 2, h / 2
+        r_base = min(w, h) * 0.33
+
+        colors = self.MOOD_COLORS[self._mood]
+        c1 = QColor.fromRgbF(*colors[0], 0.85)
+        c2 = QColor.fromRgbF(*colors[1], 0.4)
+
+        # Outer glow rings (slow pulse)
+        for i in range(3):
+            pulse = math.sin(self._phase + i * 0.8) * 0.5 + 0.5
+            r = r_base * (1.05 + i * 0.18 + pulse * 0.12)
+            alpha = 0.12 - i * 0.035
+            glow = QColor.fromRgbF(*colors[1], alpha)
+            p.setBrush(QBrush(glow))
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
+
+        # Core orb — radial gradient
+        pulse_core = math.sin(self._phase * 1.1) * 0.5 + 0.5
+        r_core = r_base * (0.85 + pulse_core * 0.1)
+
+        grad = QRadialGradient(cx, cy, r_core)
+        grad.setColorAt(0.0, QColor.fromRgbF(*colors[0], 0.95))
+        grad.setColorAt(0.5, QColor.fromRgbF(*colors[1], 0.75))
+        grad.setColorAt(1.0, QColor.fromRgbF(*colors[1], 0.0))
+        p.setBrush(QBrush(grad))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(int(cx - r_core), int(cy - r_core), int(r_core * 2), int(r_core * 2))
+
+        # Inner bright spot
+        r_spot = r_base * 0.28
+        spot = QRadialGradient(cx - r_base*0.12, cy - r_base*0.12, r_spot)
+        spot.setColorAt(0.0, QColor.fromRgbF(1, 1, 1, 0.55))
+        spot.setColorAt(1.0, QColor.fromRgbF(1, 1, 1, 0.0))
+        p.setBrush(QBrush(spot))
+        p.drawEllipse(int(cx - r_spot*1.3), int(cy - r_spot*1.3), int(r_spot*2.6), int(r_spot*2.6))
+
+        p.end()
+
+
+# ─────────────────────────────────────────────
+#  MAIN WINDOW
+# ─────────────────────────────────────────────
+
+STYLE = """
+QMainWindow, QWidget#root {
+    background-color: #0d0f14;
+}
+QWidget {
+    background-color: transparent;
+    color: #c8d4e8;
+    font-family: 'Segoe UI', sans-serif;
+}
+QPushButton#moodBtn {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 18px;
+    padding: 8px 20px;
+    font-size: 13px;
+    color: #8fa4c8;
+    letter-spacing: 1px;
+}
+QPushButton#moodBtn:hover {
+    background: rgba(255,255,255,0.09);
+    color: #c8d4e8;
+}
+QPushButton#moodBtn[active="true"] {
+    background: rgba(130,170,255,0.15);
+    border: 1px solid rgba(130,170,255,0.4);
+    color: #aac4ff;
+}
+QPushButton#playBtn {
+    background: rgba(130,170,255,0.12);
+    border: 1px solid rgba(130,170,255,0.25);
+    border-radius: 28px;
+    font-size: 22px;
+    color: #aac4ff;
+    min-width: 56px;
+    min-height: 56px;
+    max-width: 56px;
+    max-height: 56px;
+}
+QPushButton#playBtn:hover {
+    background: rgba(130,170,255,0.22);
+}
+QSlider::groove:horizontal {
+    height: 3px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: #7aa2f7;
+    border: none;
+    width: 14px;
+    height: 14px;
+    margin: -6px 0;
+    border-radius: 7px;
+}
+QSlider::sub-page:horizontal {
+    background: rgba(122,162,247,0.55);
+    border-radius: 2px;
+}
+QLabel#title {
+    font-size: 22px;
+    font-weight: 300;
+    letter-spacing: 6px;
+    color: #dce8ff;
+}
+QLabel#desc {
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: rgba(140,160,200,0.55);
+}
+QLabel#sliderLabel {
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: rgba(140,160,200,0.45);
+    text-transform: uppercase;
+}
+QFrame#divider {
+    background: rgba(255,255,255,0.06);
+    max-height: 1px;
+}
+"""
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.engine   = AudioEngine()
+        self.playing  = False
+        self.cur_mood = "Focus"
+
+        self.setWindowTitle("ambient")
+        self.setFixedSize(380, 580)
+        self.setStyleSheet(STYLE)
+
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(30, 36, 30, 36)
+        lay.setSpacing(0)
+
+        # ── Title ──────────────────────────────
+        title = QLabel("A M B I E N T")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignCenter)
+        lay.addWidget(title)
+
+        lay.addSpacing(4)
+        self.desc_label = QLabel(AudioEngine.MOODS["Focus"]["desc"])
+        self.desc_label.setObjectName("desc")
+        self.desc_label.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.desc_label)
+
+        lay.addSpacing(28)
+
+        # ── Visualizer ─────────────────────────
+        self.viz = VisualizerWidget()
+        lay.addWidget(self.viz, alignment=Qt.AlignCenter)
+
+        lay.addSpacing(28)
+
+        # ── Mood buttons ───────────────────────
+        mood_row = QHBoxLayout()
+        mood_row.setSpacing(10)
+        self.mood_btns = {}
+        for mood in ["Focus", "Dreamy", "Rain"]:
+            btn = QPushButton(mood)
+            btn.setObjectName("moodBtn")
+            btn.setProperty("active", mood == self.cur_mood)
+            btn.clicked.connect(lambda _, m=mood: self.set_mood(m))
+            mood_row.addWidget(btn)
+            self.mood_btns[mood] = btn
+        lay.addLayout(mood_row)
+
+        lay.addSpacing(28)
+
+        # ── Divider ────────────────────────────
+        div = QFrame()
+        div.setObjectName("divider")
+        lay.addWidget(div)
+
+        lay.addSpacing(22)
+
+        # ── Volume slider ──────────────────────
+        vol_lbl = QLabel("VOLUME")
+        vol_lbl.setObjectName("sliderLabel")
+        lay.addWidget(vol_lbl)
+        lay.addSpacing(8)
+
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(35)
+        self.vol_slider.valueChanged.connect(
+            lambda v: self.engine.set_volume(v / 100))
+        lay.addWidget(self.vol_slider)
+
+        lay.addSpacing(18)
+
+        # ── Intensity slider ───────────────────
+        int_lbl = QLabel("INTENSITY")
+        int_lbl.setObjectName("sliderLabel")
+        lay.addWidget(int_lbl)
+        lay.addSpacing(8)
+
+        self.int_slider = QSlider(Qt.Horizontal)
+        self.int_slider.setRange(0, 100)
+        self.int_slider.setValue(50)
+        self.int_slider.valueChanged.connect(
+            lambda v: self.engine.set_intensity(v / 100))
+        lay.addWidget(self.int_slider)
+
+        lay.addSpacing(28)
+
+        # ── Play button ────────────────────────
+        self.play_btn = QPushButton("▶")
+        self.play_btn.setObjectName("playBtn")
+        self.play_btn.clicked.connect(self.toggle_play)
+        lay.addWidget(self.play_btn, alignment=Qt.AlignCenter)
+
+        lay.addStretch()
+
+    def set_mood(self, mood):
+        self.cur_mood = mood
+        self.engine.set_mood(mood)
+        self.viz.set_mood(mood)
+        self.desc_label.setText(AudioEngine.MOODS[mood]["desc"])
+
+        for name, btn in self.mood_btns.items():
+            btn.setProperty("active", name == mood)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def toggle_play(self):
+        if self.playing:
+            self.engine.stop()
+            self.play_btn.setText("▶")
+            self.viz.set_playing(False)
+        else:
+            self.engine.start()
+            self.play_btn.setText("■")
+            self.viz.set_playing(True)
+        self.playing = not self.playing
+
+    def closeEvent(self, event):
+        self.engine.stop()
+        super().closeEvent(event)
+
+
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("ambient")
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
