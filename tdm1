@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPropertyAnimation, QEasingCurve, Property
 from PySide6.QtGui import QFont, QColor, QPainter, QRadialGradient, QLinearGradient, QPen, QBrush, QPainterPath
 import math
+import os
 
 # ─────────────────────────────────────────────
 #  AUDIO ENGINE
@@ -386,6 +387,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ambient")
         self.setFixedSize(380, 580)
         self.setStyleSheet(STYLE)
+
+        # Window icon
+        from PySide6.QtGui import QIcon
+        _ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ambient.ico")
+        if os.path.exists(_ico):
+            self.setWindowIcon(QIcon(_ico))
 
         root = QWidget()
         root.setObjectName("root")
