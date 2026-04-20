@@ -1,13 +1,15 @@
 @echo off
-echo Building ambient.exe ...
+echo Activating venv...
+call "%~dp0venv\Scripts\activate.bat"
 
+echo Building ambient.exe ...
 pyinstaller ^
   --onefile ^
   --windowed ^
-  --icon=ambient.ico ^
-  --add-data "ambient.ico;." ^
+  --icon="%~dp0ambient.ico" ^
+  --add-data "%~dp0ambient.ico;." ^
   --name ambient ^
-  ambient_player.py
+  "%~dp0ambient_player.py"
 
 echo.
 echo Done! Your exe is in the dist\ folder.
