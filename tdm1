@@ -1,376 +1,204 @@
 import sys
 import os
-import numpy as np
-import sounddevice as sd
-import threading
-import time
+import json
+import base64
 import math
-import random
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QSlider, QLabel, QFrame
-)
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QRadialGradient, QBrush, QIcon
 
-SR     = 44100
-BLOCK  = 1024
-TWO_PI = 2.0 * math.pi
+# ── Collect files ──────────────────────────────────────────────────────────────
 
-# ── Reverb ────────────────────────────────────────────────────────────────────
+def collect_files(root: str) -> list[dict]:
+    """Walk root folder and return list of {rel_path, b64_content} dicts."""
+    entries = []
+    root = os.path.abspath(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Skip hidden / cache dirs
+        dirnames[:] = [d for d in dirnames if not d.startswith('.') and d != '__pycache__']
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            rel   = os.path.relpath(fpath, root).replace('\\', '/')
+            try:
+                with open(fpath, 'rb') as f:
+                    data = f.read()
+                entries.append({'p': rel, 'd': base64.b64encode(data).decode()})
+                print(f"  + {rel}  ({len(data)} bytes)")
+            except Exception as e:
+                print(f"  ! skipping {rel}: {e}")
+    return entries
 
-class SimpleReverb:
-    COMB_DELAYS    = [1557, 1617, 1491, 1422]
-    ALLPASS_DELAYS = [225, 556]
-    def __init__(self):
-        self._wet  = 0.3
-        self._combs   = [np.zeros(d) for d in self.COMB_DELAYS]
-        self._comb_i  = [0]*4
-        self._ap      = [np.zeros(d) for d in self.ALLPASS_DELAYS]
-        self._ap_i    = [0,0]
-    def set_wet(self, w): self._wet = float(w)
-    def process(self, signal):
-        if self._wet < 0.005: return signal
-        out = np.zeros_like(signal)
-        for i,(buf,dl) in enumerate(zip(self._combs,self.COMB_DELAYS)):
-            idx=self._comb_i[i]; decay=0.84
-            for n,s in enumerate(signal):
-                d=buf[idx]; buf[idx]=s+d*decay; out[n]+=d; idx=(idx+1)%dl
-            self._comb_i[i]=idx
-        out /= len(self.COMB_DELAYS)
-        for i,(buf,dl) in enumerate(zip(self._ap,self.ALLPASS_DELAYS)):
-            idx=self._ap_i[i]; g=0.5; res=np.zeros_like(out)
-            for n,s in enumerate(out):
-                d=buf[idx]; buf[idx]=s+d*g; res[n]=d-g*buf[idx]; idx=(idx+1)%dl
-            self._ap_i[i]=idx; out=res
-        return signal*(1-self._wet)+out*self._wet
 
-# ── Layer base ────────────────────────────────────────────────────────────────
+def build_chunks(entries: list[dict], chunk_size: int = 800) -> list[str]:
+    """
+    Serialize entries to JSON, split into chunk_size-byte pieces.
+    Each chunk is a plain string: "INDEX/TOTAL:payload"
+    payload is a slice of the base64-encoded full JSON.
+    """
+    full_json  = json.dumps(entries, separators=(',', ':'))
+    full_b64   = base64.b64encode(full_json.encode()).decode()
+    total      = math.ceil(len(full_b64) / chunk_size)
+    chunks     = []
+    for i in range(total):
+        piece = full_b64[i * chunk_size : (i + 1) * chunk_size]
+        chunks.append(f"{i+1}/{total}:{piece}")
+    return chunks
 
-class Layer:
-    def __init__(self,name,color):
-        self.name=name; self.color=color
-        self.enabled=False; self.volume=0.5
-        self._t=0; self._fade=0.0
-    def enable(self,v): self.enabled=v
-    def set_volume(self,v): self.volume=max(0.0,min(1.0,v))
-    def generate(self,frames): raise NotImplementedError
-    def tick(self,frames):
-        target=1.0 if self.enabled else 0.0
-        step=frames/(SR*1.2)
-        self._fade=np.clip(self._fade+(step if target else -step),0,1)
-        if self._fade<0.001: self._t+=frames; return np.zeros(frames)
-        sig=self.generate(frames)*self.volume*self._fade
-        self._t+=frames; return sig
 
-# ── Layers ────────────────────────────────────────────────────────────────────
+# ── Generate QR images ─────────────────────────────────────────────────────────
 
-class DroneLayer(Layer):
-    def __init__(self):
-        super().__init__("Deep Drone",(0.4,0.6,1.0)); self.volume=0.7
-        self._ph1=0.0; self._ph2=0.0; self._ph3=0.0; self._lfo_ph=0.0
-    def generate(self,frames):
-        f1,f2=55.0,55.14; f3=f1*2; lfo_f=0.07
-        dp1=TWO_PI*f1/SR; dp2=TWO_PI*f2/SR; dp3=TWO_PI*f3/SR; dlfo=TWO_PI*lfo_f/SR
-        sig=np.empty(frames)
-        p1,p2,p3,pl=self._ph1,self._ph2,self._ph3,self._lfo_ph
-        for n in range(frames):
-            lfo=1.0+0.04*math.sin(pl)
-            sig[n]=(0.6*math.sin(p1)+0.6*math.sin(p2)+0.25*math.sin(p3))*lfo/1.45
-            p1+=dp1; p2+=dp2; p3+=dp3; pl+=dlfo
-        self._ph1=p1%TWO_PI; self._ph2=p2%TWO_PI; self._ph3=p3%TWO_PI; self._lfo_ph=pl%TWO_PI
-        return sig
+def make_qr_image(text: str):
+    """
+    Render QR code using only qrcode + PySide6/Qt — no Pillow, no PyPNG.
+    Uses ERROR_CORRECT_L for maximum data capacity per code.
+    Returns a QPixmap.
+    """
+    import qrcode
+    from PySide6.QtGui import QPixmap, QPainter, QColor
+    from PySide6.QtCore import Qt
 
-class ShimmerLayer(Layer):
-    def __init__(self):
-        super().__init__("Shimmer",(0.75,0.55,1.0)); self.volume=0.45
-        base=293.66
-        ratios=[1.0,1.5,2.0,3.0,4.0]
-        self._phases=[0.0]*len(ratios)   # one phase per harmonic
-        self._lfo_phases=[0.0]*len(ratios)
-        self._sh_ph=0.0; self._sh_lfo_ph=0.0
-        self._freqs=[base*r for r in ratios]
-        self._amps=[1.0,0.55,0.35,0.18,0.08]
-        self._lfo_rates=[0.11+r*0.04 for r in ratios]
-    def generate(self,frames):
-        sig=np.zeros(frames)
-        total=sum(self._amps)+0.12
-        for hi,(freq,amp,lfo_rate) in enumerate(zip(self._freqs,self._amps,self._lfo_rates)):
-            dp=TWO_PI*freq/SR; dlfo=TWO_PI*lfo_rate/SR
-            ph=self._phases[hi]; lph=self._lfo_phases[hi]
-            for n in range(frames):
-                lfo=1.0+0.07*math.sin(lph)
-                sig[n]+=amp*lfo*math.sin(ph)
-                ph+=dp; lph+=dlfo
-            self._phases[hi]=ph%TWO_PI; self._lfo_phases[hi]=lph%TWO_PI
-        # shimmer high partial
-        sh_freq=293.66*8; dp_sh=TWO_PI*sh_freq/SR; dlfo_sh=TWO_PI*0.23/SR
-        ph=self._sh_ph; lph=self._sh_lfo_ph
-        for n in range(frames):
-            env=math.sin(lph)*0.5+0.5
-            sig[n]+=0.12*env*math.sin(ph)
-            ph+=dp_sh; lph+=dlfo_sh
-        self._sh_ph=ph%TWO_PI; self._sh_lfo_ph=lph%TWO_PI
-        return sig/total
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=1,
+        border=4,
+    )
+    qr.add_data(text)
+    qr.make(fit=True)
 
-class RainLayer(Layer):
-    def __init__(self):
-        super().__init__("Rain",(0.4,0.8,0.7))
-        self._pb=np.zeros(7); self._dtimer=0
-        self._dbuf=np.zeros(512); self._dpos=512; self.volume=0.55
-    def _pink(self,w):
-        b=self._pb; out=np.empty_like(w)
-        for i,x in enumerate(w):
-            b[0]=0.99886*b[0]+x*0.0555179; b[1]=0.99332*b[1]+x*0.0750759
-            b[2]=0.96900*b[2]+x*0.1538520; b[3]=0.86650*b[3]+x*0.3104856
-            b[4]=0.55000*b[4]+x*0.5329522; b[5]=-0.7616*b[5]-x*0.0168980
-            out[i]=(b[0]+b[1]+b[2]+b[3]+b[4]+b[5]+b[6]+x*0.5362)*0.11
-            b[6]=x*0.115926
-        self._pb=b; return out
-    def generate(self,frames):
-        sig=self._pink(np.random.randn(frames))*0.9
-        pos=self._dpos
-        for n in range(frames):
-            if pos>=len(self._dbuf):
-                self._dtimer+=1
-                ivl=int(random.uniform(0.05,0.35)*SR)
-                if self._dtimer%max(1,ivl//BLOCK)==0:
-                    amp=random.uniform(0.15,0.5); dur=random.randint(80,300)
-                    env=np.exp(-np.arange(dur)/(dur*0.15))
-                    self._dbuf=amp*env*np.random.randn(dur); pos=0
-            if pos<len(self._dbuf): sig[n]+=self._dbuf[pos]; pos+=1
-        self._dpos=pos; return sig
+    matrix  = qr.get_matrix()
+    size    = len(matrix)
+    px_size = size * 10
 
-class WindLayer(Layer):
-    def __init__(self):
-        super().__init__("Wind",(0.5,0.85,0.6)); self._br=0.0; self._lp=0.0; self.volume=0.4
-        self._lfo1_ph=0.0; self._lfo2_ph=0.0
-    def generate(self,frames):
-        w=np.random.randn(frames); out=np.empty(frames); s=self._br
-        for i,x in enumerate(w): s=(s+0.02*x)/1.02; out[i]=s
-        self._br=s
-        dlfo1=TWO_PI*0.04/SR; dlfo2=TWO_PI*0.11/SR
-        lp1,lp2=self._lfo1_ph,self._lfo2_ph
-        mod=np.empty(frames)
-        for n in range(frames):
-            mod[n]=0.3+0.7*(0.5+0.5*math.sin(lp1))*(0.5+0.5*math.sin(lp2))
-            lp1+=dlfo1; lp2+=dlfo2
-        self._lfo1_ph=lp1%TWO_PI; self._lfo2_ph=lp2%TWO_PI
-        lp=self._lp
-        for i in range(frames): lp=lp*0.998+out[i]*0.002; out[i]=lp
-        self._lp=lp
-        out*=mod; peak=np.max(np.abs(out))+1e-9; return out/peak*0.6
+    pixmap = QPixmap(px_size, px_size)
+    pixmap.fill(QColor("white"))
 
-class PulseLayer(Layer):
-    def __init__(self):
-        super().__init__("Pulse",(1.0,0.65,0.5)); self.volume=0.4
-        self._env_ph=0.0; self._ph1=0.0; self._ph2=0.0; self._ph3=0.0
-    def generate(self,frames):
-        f=82.41
-        denv=TWO_PI*0.22/SR; dp1=TWO_PI*f/SR; dp2=TWO_PI*f*1.5/SR; dp3=TWO_PI*f*2/SR
-        sig=np.empty(frames)
-        ep,p1,p2,p3=self._env_ph,self._ph1,self._ph2,self._ph3
-        for n in range(frames):
-            env=(math.sin(ep)*0.5+0.5)**4
-            sig[n]=env*(math.sin(p1)+0.4*math.sin(p2)+0.2*math.sin(p3))*0.7
-            ep+=denv; p1+=dp1; p2+=dp2; p3+=dp3
-        self._env_ph=ep%TWO_PI; self._ph1=p1%TWO_PI; self._ph2=p2%TWO_PI; self._ph3=p3%TWO_PI
-        return sig
+    painter = QPainter(pixmap)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor("black"))
+    for y, row in enumerate(matrix):
+        for x, dark in enumerate(row):
+            if dark:
+                painter.drawRect(x * 10, y * 10, 10, 10)
+    painter.end()
 
-class BellLayer(Layer):
-    NOTES=[261.63,293.66,329.63,392.0,440.0,523.25,587.33,659.25]
-    def __init__(self):
-        super().__init__("Bells",(1.0,0.9,0.55))
-        self._next=int(random.uniform(2,6)*SR); self._events=[]; self.volume=0.35
-    def _tone(self,freq,amp,dur_s):
-        n=int(dur_s*SR); t=np.arange(n,dtype=np.float64)
-        env=np.exp(-t/(dur_s*SR*0.18))
-        # Short attack ramp to prevent onset click (4ms)
-        attack=min(int(0.004*SR),n)
-        env[:attack]*=np.linspace(0,1,attack)
-        return amp*env*(np.sin(TWO_PI*freq*t/SR)+0.35*np.sin(TWO_PI*freq*2.76*t/SR)+0.12*np.sin(TWO_PI*freq*5.4*t/SR))
-    def generate(self,frames):
-        sig=np.zeros(frames)
-        if self._t>=self._next:
-            tone=self._tone(random.choice(self.NOTES),random.uniform(0.3,0.7),random.uniform(1.8,4.0))
-            self._events.append([self._t,tone])
-            self._next=self._t+int(random.uniform(3,10)*SR)
-        alive=[]
-        for ev in self._events:
-            st,tone=ev; off=self._t-st
-            if off>=len(tone): continue
-            av=min(frames,len(tone)-off); sig[:av]+=tone[off:off+av]; alive.append(ev)
-        self._events=alive; return sig
+    return pixmap
 
-class NoiseLayer(Layer):
-    def __init__(self):
-        super().__init__("Noise",(0.65,0.65,0.7)); self._pb=np.zeros(7); self._br=0.0; self.volume=0.3
-    def _pink(self,w):
-        b=self._pb; out=np.empty_like(w)
-        for i,x in enumerate(w):
-            b[0]=0.99886*b[0]+x*0.0555179; b[1]=0.99332*b[1]+x*0.0750759
-            b[2]=0.96900*b[2]+x*0.1538520; b[3]=0.86650*b[3]+x*0.3104856
-            b[4]=0.55000*b[4]+x*0.5329522; b[5]=-0.7616*b[5]-x*0.0168980
-            out[i]=(b[0]+b[1]+b[2]+b[3]+b[4]+b[5]+b[6]+x*0.5362)*0.11
-            b[6]=x*0.115926
-        self._pb=b; return out
-    def generate(self,frames):
-        w=np.random.randn(frames); p=self._pink(w.copy())
-        out=np.empty(frames); s=self._br
-        for i,x in enumerate(w): s=(s+0.02*x)/1.02; out[i]=s
-        self._br=s; brown=out/(np.max(np.abs(out))+1e-9)*0.5
-        return w*0.15+p*0.5+brown*0.35
 
-# ── Engine ────────────────────────────────────────────────────────────────────
+# ── PySide6 slideshow ──────────────────────────────────────────────────────────
 
-class AudioEngine:
-    def __init__(self):
-        self.layers=[DroneLayer(),ShimmerLayer(),RainLayer(),WindLayer(),PulseLayer(),BellLayer(),NoiseLayer()]
-        self.master_vol=0.5; self.reverb=SimpleReverb()
-        self._playing=False; self._stream=None; self._lock=threading.Lock()
-    def set_master(self,v): self.master_vol=max(0.0,min(1.0,v))
-    def set_reverb(self,v): self.reverb.set_wet(v)
-    def start(self):
-        if self._playing: return
-        self._playing=True
-        self._stream=sd.OutputStream(samplerate=SR,channels=2,blocksize=BLOCK,dtype='float32',callback=self._cb)
-        self._stream.start()
-    def stop(self):
-        self._playing=False
-        if self._stream: self._stream.stop(); self._stream.close(); self._stream=None
-    def _cb(self,outdata,frames,t,s):
-        mix=np.zeros(frames,dtype=np.float64)
-        with self._lock:
-            for l in self.layers: mix+=l.tick(frames)
-        mix=self.reverb.process(mix)*self.master_vol
-        mix=np.tanh(mix*1.1)/1.1
-        sp=7; right=np.concatenate([mix[sp:],mix[:sp]])
-        outdata[:,0]=mix.astype(np.float32); outdata[:,1]=right.astype(np.float32)
+SLIDESHOW_HZ = 20  # auto-advance rate — must match what receiver expects
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+def run_slideshow(chunks: list[str]):
+    from PySide6.QtWidgets import (
+        QApplication, QWidget, QLabel, QVBoxLayout, QSizePolicy
+    )
+    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtGui import QKeyEvent
 
-STYLE="""
-QMainWindow,QWidget#root{background:#0c0e13;}
-QWidget{background:transparent;color:#c0cce0;font-family:'Segoe UI',sans-serif;}
-QPushButton#toggleBtn{border-radius:16px;border:1.5px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);font-size:18px;min-width:36px;max-width:36px;min-height:36px;max-height:36px;}
-QPushButton#toggleBtn:hover{background:rgba(255,255,255,0.09);}
-QPushButton#toggleBtn[on="true"]{border:1.5px solid rgba(180,210,255,0.45);background:rgba(120,170,255,0.18);}
-QPushButton#playBtn{border-radius:26px;border:1.5px solid rgba(140,180,255,0.3);background:rgba(120,160,255,0.12);font-size:20px;color:#aac0ff;min-width:52px;max-width:52px;min-height:52px;max-height:52px;}
-QPushButton#playBtn:hover{background:rgba(120,160,255,0.22);}
-QLabel#layerName{font-size:11px;letter-spacing:1.5px;color:rgba(190,205,230,0.75);}
-QLabel#secLbl{font-size:9px;letter-spacing:3px;color:rgba(130,150,190,0.4);}
-QLabel#title{font-size:20px;font-weight:300;letter-spacing:8px;color:#d8e8ff;}
-QSlider::groove:horizontal{height:2px;background:rgba(255,255,255,0.08);border-radius:1px;}
-QSlider::handle:horizontal{background:#7090d0;border:none;width:12px;height:12px;margin:-5px 0;border-radius:6px;}
-QSlider::sub-page:horizontal{background:rgba(100,140,220,0.5);border-radius:1px;}
-QFrame#div{background:rgba(255,255,255,0.05);max-height:1px;}
-QFrame#card{background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.06);border-radius:12px;}
-"""
+    app = QApplication.instance() or QApplication(sys.argv)
 
-class LayerStrip(QFrame):
-    def __init__(self,layer,parent=None):
-        super().__init__(parent); self.layer=layer; self.setObjectName("card")
-        row=QHBoxLayout(self); row.setContentsMargins(14,9,14,9); row.setSpacing(12)
-        r,g,b=[int(c*255) for c in layer.color]
-        dot=QLabel("●"); dot.setStyleSheet(f"color:rgb({r},{g},{b});font-size:13px;"); dot.setFixedWidth(14)
-        row.addWidget(dot)
-        nm=QLabel(layer.name.upper()); nm.setObjectName("layerName"); nm.setFixedWidth(90)
-        row.addWidget(nm)
-        sl=QSlider(Qt.Horizontal); sl.setRange(0,100); sl.setValue(int(layer.volume*100))
-        sl.valueChanged.connect(lambda v:layer.set_volume(v/100)); row.addWidget(sl,stretch=1)
-        self.btn=QPushButton("◎"); self.btn.setObjectName("toggleBtn"); self.btn.setProperty("on",False); self.btn.setCheckable(True)
-        self.btn.clicked.connect(self._tog); row.addWidget(self.btn)
-    def _tog(self,checked):
-        self.layer.enable(checked); self.btn.setProperty("on",checked)
-        self.btn.setText("◉" if checked else "◎")
-        self.btn.style().unpolish(self.btn); self.btn.style().polish(self.btn)
+    total = len(chunks)
+    print(f"\nGenerating {total} QR codes… (this may take a moment)")
+    pixmaps = []
+    for i, chunk in enumerate(chunks):
+        print(f"  QR {i+1}/{total}…", end='\r')
+        pixmaps.append(make_qr_image(chunk))
+    print(f"  Done! {total} QR codes ready.          ")
 
-class Orb(QWidget):
-    def __init__(self,engine,parent=None):
-        super().__init__(parent); self.engine=engine; self._ph=0.0; self.setFixedSize(150,150)
-        t=QTimer(self); t.timeout.connect(self._tick); t.start(40)
-    def _tick(self): self._ph+=0.018; self.update()
-    def paintEvent(self,event):
-        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
-        cx,cy=self.width()/2,self.height()/2; r=48
-        active=[l for l in self.engine.layers if l.enabled]
-        if active:
-            cr=sum(l.color[0] for l in active)/len(active)
-            cg=sum(l.color[1] for l in active)/len(active)
-            cb=sum(l.color[2] for l in active)/len(active)
-        else: cr,cg,cb=0.28,0.38,0.58
-        pulse=math.sin(self._ph)*0.5+0.5
-        for i in range(4,0,-1):
-            gr=r*(1.0+i*0.22+pulse*0.08); a=max(0,0.055-i*0.01)
-            p.setBrush(QBrush(QColor.fromRgbF(cr,cg,cb,a))); p.setPen(Qt.NoPen)
-            p.drawEllipse(int(cx-gr),int(cy-gr),int(gr*2),int(gr*2))
-        rc=r*(0.88+pulse*0.10)
-        g=QRadialGradient(cx,cy,rc)
-        g.setColorAt(0.0,QColor.fromRgbF(min(1,cr+0.3),min(1,cg+0.25),min(1,cb+0.2),0.95))
-        g.setColorAt(0.6,QColor.fromRgbF(cr,cg,cb,0.75))
-        g.setColorAt(1.0,QColor.fromRgbF(cr*0.6,cg*0.6,cb*0.6,0.0))
-        p.setBrush(QBrush(g)); p.drawEllipse(int(cx-rc),int(cy-rc),int(rc*2),int(rc*2))
-        rs=r*0.25; sx,sy=cx-r*0.16,cy-r*0.16
-        sg=QRadialGradient(sx,sy,rs); sg.setColorAt(0,QColor.fromRgbF(1,1,1,0.5)); sg.setColorAt(1,QColor.fromRgbF(1,1,1,0))
-        p.setBrush(QBrush(sg)); p.drawEllipse(int(sx-rs),int(sy-rs),int(rs*2),int(rs*2)); p.end()
+    class Slideshow(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.idx     = 0
+            self.running = False  # auto-play starts only when user is ready
+            self.setWindowTitle("QR Transfer")
+            self.setStyleSheet("background: white;")
 
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.engine=AudioEngine(); self.playing=False
-        self.setWindowTitle("ambient"); self.setFixedWidth(420); self.setStyleSheet(STYLE)
-        ico=os.path.join(os.path.dirname(os.path.abspath(__file__)),"ambient.ico")
-        if os.path.exists(ico): self.setWindowIcon(QIcon(ico))
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(20, 20, 20, 20)
 
-        root=QWidget(); root.setObjectName("root"); self.setCentralWidget(root)
-        main=QVBoxLayout(root); main.setContentsMargins(24,26,24,24); main.setSpacing(0)
+            self.qr_label = QLabel(alignment=Qt.AlignCenter)
+            self.qr_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            layout.addWidget(self.qr_label)
 
-        # Header
-        top=QHBoxLayout(); top.setSpacing(0)
-        left=QVBoxLayout(); left.setSpacing(4)
-        t=QLabel("A M B I E N T"); t.setObjectName("title"); left.addWidget(t)
-        s=QLabel("GENERATIVE SOUNDSCAPE"); s.setObjectName("secLbl"); left.addWidget(s)
-        left.addSpacing(12)
-        self.play_btn=QPushButton("▶"); self.play_btn.setObjectName("playBtn")
-        self.play_btn.clicked.connect(self.toggle_play); left.addWidget(self.play_btn)
-        left.addStretch()
-        top.addLayout(left); top.addStretch()
-        self.orb=Orb(self.engine); top.addWidget(self.orb,alignment=Qt.AlignTop)
-        main.addLayout(top); main.addSpacing(18)
+            self.info_label = QLabel(alignment=Qt.AlignCenter)
+            self.info_label.setStyleSheet("font-size: 28px; font-weight: bold; color: #333;")
+            layout.addWidget(self.info_label)
 
-        div=QFrame(); div.setObjectName("div"); main.addWidget(div); main.addSpacing(14)
+            self.hint_label = QLabel(alignment=Qt.AlignCenter)
+            self.hint_label.setStyleSheet("font-size: 14px; color: #888;")
+            layout.addWidget(self.hint_label)
 
-        lbl=QLabel("LAYERS"); lbl.setObjectName("secLbl"); main.addWidget(lbl); main.addSpacing(8)
+            self.timer = QTimer()
+            self.timer.setInterval(1000 // SLIDESHOW_HZ)
+            self.timer.timeout.connect(self._auto_advance)
 
-        for layer in self.engine.layers:
-            main.addWidget(LayerStrip(layer)); main.addSpacing(5)
+            self.show_current()
+            self.showFullScreen()
 
-        main.addSpacing(12)
-        div2=QFrame(); div2.setObjectName("div"); main.addWidget(div2); main.addSpacing(14)
-        lbl2=QLabel("MASTER"); lbl2.setObjectName("secLbl"); main.addWidget(lbl2); main.addSpacing(10)
+        def show_current(self):
+            px = pixmaps[self.idx]
+            screen = QApplication.primaryScreen().size()
+            max_side = int(min(screen.width(), screen.height()) * 0.75)
+            self.qr_label.setPixmap(
+                px.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            self.info_label.setText(f"QR  {self.idx + 1}  /  {total}")
+            if self.running:
+                self.hint_label.setText("● RECORDING — SPACE or click to stop")
+                self.hint_label.setStyleSheet("font-size: 14px; color: red; font-weight: bold;")
+            else:
+                self.hint_label.setText("SPACE / click = start auto-play  |  ← → = manual step  |  ESC = quit")
+                self.hint_label.setStyleSheet("font-size: 14px; color: #888;")
 
-        def slider_row(label,init,cb):
-            row=QHBoxLayout(); row.setSpacing(12)
-            l=QLabel(label); l.setObjectName("secLbl")
-            l.setStyleSheet("font-size:10px;letter-spacing:2px;color:rgba(130,150,190,0.5);")
-            l.setFixedWidth(68); row.addWidget(l)
-            sl=QSlider(Qt.Horizontal); sl.setRange(0,100); sl.setValue(init)
-            sl.valueChanged.connect(cb); row.addWidget(sl); return row
+        def _auto_advance(self):
+            if self.idx < total - 1:
+                self.idx += 1
+                self.show_current()
+            else:
+                self.timer.stop()
+                self.running = False
+                self.hint_label.setText("✓ Done! Stop your recording.")
+                self.hint_label.setStyleSheet("font-size: 18px; color: green; font-weight: bold;")
 
-        main.addLayout(slider_row("VOLUME",50,lambda v:self.engine.set_master(v/100)))
-        main.addSpacing(10)
-        main.addLayout(slider_row("REVERB",30,lambda v:self.engine.set_reverb(v/100*0.55)))
-        main.addStretch()
+        def toggle_autoplay(self):
+            self.running = not self.running
+            if self.running:
+                self.idx = 0  # always restart from beginning
+                self.timer.start()
+            else:
+                self.timer.stop()
+            self.show_current()
 
-    def toggle_play(self):
-        if self.playing: self.engine.stop(); self.play_btn.setText("▶")
-        else: self.engine.start(); self.play_btn.setText("■")
-        self.playing=not self.playing
+        def advance(self, delta: int):
+            if not self.running:
+                self.idx = max(0, min(total - 1, self.idx + delta))
+                self.show_current()
 
-    def closeEvent(self,event):
-        self.engine.stop(); super().closeEvent(event)
+        def mousePressEvent(self, event):
+            self.toggle_autoplay()
 
-if __name__=="__main__":
-    app=QApplication(sys.argv)
-    win=MainWindow(); win.show()
-    sys.exit(app.exec())
+        def keyPressEvent(self, event: QKeyEvent):
+            key = event.key()
+            if key == Qt.Key_Space:
+                self.toggle_autoplay()
+            elif key == Qt.Key_Right:
+                self.advance(+1)
+            elif key == Qt.Key_Left:
+                self.advance(-1)
+            elif key == Qt.Key_Escape:
+                self.close()
+
+    win = Slideshow()
+    app.exec()
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    root = sys.argv[1] if len(sys.argv) > 1 else '.'
+    print(f"Scanning: {os.path.abspath(root)}\n")
+    entries = collect_files(root)
+    if not entries:
+        print("No files found!")
+        sys.exit(1)
+    print(f"\nFound {len(entries)} file(s).")
+    chunks = build_chunks(entries, chunk_size=2000)
+    print(f"Split into {len(chunks)} QR chunk(s).\n")
+    run_slideshow(chunks)
