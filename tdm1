@@ -1,204 +1,409 @@
-import sys
-import os
-import json
-import base64
-import math
-
-# ── Collect files ──────────────────────────────────────────────────────────────
-
-def collect_files(root: str) -> list[dict]:
-    """Walk root folder and return list of {rel_path, b64_content} dicts."""
-    entries = []
-    root = os.path.abspath(root)
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Skip hidden / cache dirs
-        dirnames[:] = [d for d in dirnames if not d.startswith('.') and d != '__pycache__']
-        for fname in filenames:
-            fpath = os.path.join(dirpath, fname)
-            rel   = os.path.relpath(fpath, root).replace('\\', '/')
-            try:
-                with open(fpath, 'rb') as f:
-                    data = f.read()
-                entries.append({'p': rel, 'd': base64.b64encode(data).decode()})
-                print(f"  + {rel}  ({len(data)} bytes)")
-            except Exception as e:
-                print(f"  ! skipping {rel}: {e}")
-    return entries
 
 
-def build_chunks(entries: list[dict], chunk_size: int = 800) -> list[str]:
-    """
-    Serialize entries to JSON, split into chunk_size-byte pieces.
-    Each chunk is a plain string: "INDEX/TOTAL:payload"
-    payload is a slice of the base64-encoded full JSON.
-    """
-    full_json  = json.dumps(entries, separators=(',', ':'))
-    full_b64   = base64.b64encode(full_json.encode()).decode()
-    total      = math.ceil(len(full_b64) / chunk_size)
-    chunks     = []
-    for i in range(total):
-        piece = full_b64[i * chunk_size : (i + 1) * chunk_size]
-        chunks.append(f"{i+1}/{total}:{piece}")
-    return chunks
+**Что такое RPM-пакет?** Это просто архив с твоей программой + инструкция по установке (`.spec`-файл). Когда пользователь ставит пакет, RPM сам раскладывает файлы куда надо.
 
+**Что такое PyInstaller?** Он берёт твой Python-проект и упаковывает его в один исполняемый файл — всё вместе: и Python, и все библиотеки. Этот файл можно запустить на любом Альт Linux без установки Python.
 
-# ── Generate QR images ─────────────────────────────────────────────────────────
+**Наш план:**
+1. Собрать бинарник `AltPDF` через PyInstaller (на твоей машине с Linux)
+2. Упаковать этот бинарник в `.tar.gz` архив
+3. Создать `.spec`-файл с инструкцией для RPM
+4. Запустить `rpmbuild` — он создаст `.rpm`
+5. Протестировать установку
 
-def make_qr_image(text: str):
-    """
-    Render QR code using only qrcode + PySide6/Qt — no Pillow, no PyPNG.
-    Uses ERROR_CORRECT_L for maximum data capacity per code.
-    Returns a QPixmap.
-    """
-    import qrcode
-    from PySide6.QtGui import QPixmap, QPainter, QColor
-    from PySide6.QtCore import Qt
+---
 
-    qr = qrcode.QRCode(
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=1,
-        border=4,
-    )
-    qr.add_data(text)
-    qr.make(fit=True)
+## 🔧 Шаг 0 — Убедись что ты в правильном месте
 
-    matrix  = qr.get_matrix()
-    size    = len(matrix)
-    px_size = size * 10
+Открой Konsole. Сначала посмотрим где ты находишься:
 
-    pixmap = QPixmap(px_size, px_size)
-    pixmap.fill(QColor("white"))
+```bash
+pwd
+```
 
-    painter = QPainter(pixmap)
-    painter.setPen(Qt.NoPen)
-    painter.setBrush(QColor("black"))
-    for y, row in enumerate(matrix):
-        for x, dark in enumerate(row):
-            if dark:
-                painter.drawRect(x * 10, y * 10, 10, 10)
-    painter.end()
+И посмотрим структуру твоего проекта:
 
-    return pixmap
+```bash
+ls ~/
+```
 
+Нам надо найти твою папку с проектом. Скорее всего она называется что-то вроде `pdf_editor` или `AltPDF`. Допустим она в домашней папке — тогда перейди в неё:
 
-# ── PySide6 slideshow ──────────────────────────────────────────────────────────
+```bash
+cd ~/pdf_editor
+ls
+```
 
-SLIDESHOW_HZ = 20  # auto-advance rate — must match what receiver expects
+Ты должна увидеть: `build/`, `classes/`, `dist/`, `icons/`, `venv/`, и файлы `.py`. Если это не так — напиши мне что видишь, поправим путь.
 
-def run_slideshow(chunks: list[str]):
-    from PySide6.QtWidgets import (
-        QApplication, QWidget, QLabel, QVBoxLayout, QSizePolicy
-    )
-    from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QKeyEvent
+---
 
-    app = QApplication.instance() or QApplication(sys.argv)
+## 📦 Шаг 1 — Установка инструментов для сборки
 
-    total = len(chunks)
-    print(f"\nGenerating {total} QR codes… (this may take a moment)")
-    pixmaps = []
-    for i, chunk in enumerate(chunks):
-        print(f"  QR {i+1}/{total}…", end='\r')
-        pixmaps.append(make_qr_image(chunk))
-    print(f"  Done! {total} QR codes ready.          ")
+Это нужно сделать один раз. Нужны права суперпользователя:
 
-    class Slideshow(QWidget):
-        def __init__(self):
-            super().__init__()
-            self.idx     = 0
-            self.running = False  # auto-play starts only when user is ready
-            self.setWindowTitle("QR Transfer")
-            self.setStyleSheet("background: white;")
+```bash
+su
+```
+*(Введи пароль root-а)*
 
-            layout = QVBoxLayout(self)
-            layout.setContentsMargins(20, 20, 20, 20)
+```bash
+apt-get update
+apt-get install rpm-build rpmdevtools
+```
 
-            self.qr_label = QLabel(alignment=Qt.AlignCenter)
-            self.qr_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            layout.addWidget(self.qr_label)
+```bash
+exit
+```
+*(Выходим обратно из root)*
 
-            self.info_label = QLabel(alignment=Qt.AlignCenter)
-            self.info_label.setStyleSheet("font-size: 28px; font-weight: bold; color: #333;")
-            layout.addWidget(self.info_label)
+**Почему это нужно?** `rpm-build` — это сам инструмент сборки пакетов. `rpmdevtools` даёт удобную команду `rpmdev-setuptree` для создания нужной структуры папок.
 
-            self.hint_label = QLabel(alignment=Qt.AlignCenter)
-            self.hint_label.setStyleSheet("font-size: 14px; color: #888;")
-            layout.addWidget(self.hint_label)
+---
 
-            self.timer = QTimer()
-            self.timer.setInterval(1000 // SLIDESHOW_HZ)
-            self.timer.timeout.connect(self._auto_advance)
+## 🏗️ Шаг 2 — Создать рабочее пространство RPM
 
-            self.show_current()
-            self.showFullScreen()
+RPM ожидает строго определённую структуру папок в домашней директории. Создадим её автоматически:
 
-        def show_current(self):
-            px = pixmaps[self.idx]
-            screen = QApplication.primaryScreen().size()
-            max_side = int(min(screen.width(), screen.height()) * 0.75)
-            self.qr_label.setPixmap(
-                px.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-            self.info_label.setText(f"QR  {self.idx + 1}  /  {total}")
-            if self.running:
-                self.hint_label.setText("● RECORDING — SPACE or click to stop")
-                self.hint_label.setStyleSheet("font-size: 14px; color: red; font-weight: bold;")
-            else:
-                self.hint_label.setText("SPACE / click = start auto-play  |  ← → = manual step  |  ESC = quit")
-                self.hint_label.setStyleSheet("font-size: 14px; color: #888;")
+```bash
+rpmdev-setuptree
+```
 
-        def _auto_advance(self):
-            if self.idx < total - 1:
-                self.idx += 1
-                self.show_current()
-            else:
-                self.timer.stop()
-                self.running = False
-                self.hint_label.setText("✓ Done! Stop your recording.")
-                self.hint_label.setStyleSheet("font-size: 18px; color: green; font-weight: bold;")
+Проверим что получилось:
 
-        def toggle_autoplay(self):
-            self.running = not self.running
-            if self.running:
-                self.idx = 0  # always restart from beginning
-                self.timer.start()
-            else:
-                self.timer.stop()
-            self.show_current()
+```bash
+ls ~/rpmbuild/
+```
 
-        def advance(self, delta: int):
-            if not self.running:
-                self.idx = max(0, min(total - 1, self.idx + delta))
-                self.show_current()
+Должно быть:
+```
+BUILD  RPMS  SOURCES  SPECS  SRPMS
+```
 
-        def mousePressEvent(self, event):
-            self.toggle_autoplay()
+**Что это за папки?**
+- `SOURCES` — сюда кладём архив с исходниками (наш `.tar.gz`)
+- `SPECS` — сюда кладём `.spec`-файл
+- `BUILD` — тут происходит сборка (временная)
+- `RPMS` — сюда попадает готовый `.rpm`
+- `SRPMS` — исходный пакет (нам пока не нужен)
 
-        def keyPressEvent(self, event: QKeyEvent):
-            key = event.key()
-            if key == Qt.Key_Space:
-                self.toggle_autoplay()
-            elif key == Qt.Key_Right:
-                self.advance(+1)
-            elif key == Qt.Key_Left:
-                self.advance(-1)
-            elif key == Qt.Key_Escape:
-                self.close()
+---
 
-    win = Slideshow()
-    app.exec()
+## ⚠️ Шаг 2.5 — Важный момент с `.rpmmacros`
 
+Если ты использовала `rpmdev-setuptree`, нужно проверить файл настроек:
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+```bash
+cat ~/.rpmmacros
+```
 
-if __name__ == '__main__':
-    root = sys.argv[1] if len(sys.argv) > 1 else '.'
-    print(f"Scanning: {os.path.abspath(root)}\n")
-    entries = collect_files(root)
-    if not entries:
-        print("No files found!")
-        sys.exit(1)
-    print(f"\nFound {len(entries)} file(s).")
-    chunks = build_chunks(entries, chunk_size=2000)
-    print(f"Split into {len(chunks)} QR chunk(s).\n")
-    run_slideshow(chunks)
+Если там есть блок `%__arch_install_post` — его **надо удалить**, иначе сборка будет падать с ошибкой. Открой файл:
+
+```bash
+nano ~/.rpmmacros
+```
+
+Файл должен выглядеть примерно вот так (без лишних блоков):
+
+```
+%_topdir        %{getenv:HOME}/rpmbuild
+%packager       Твоё Имя <email@example.com>
+```
+
+Удали всё лишнее, сохрани (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+---
+
+## 🚀 Шаг 3 — Собрать бинарник через PyInstaller
+
+Это самый важный шаг. Нам нужен готовый исполняемый файл `AltPDF`.
+
+Перейди в папку проекта:
+
+```bash
+cd ~/pdf_editor
+```
+
+Активируй своё виртуальное окружение:
+
+```bash
+source venv/bin/activate
+```
+
+*(Подсказка: если venv называется иначе — замени `venv` на реальное имя)*
+
+Проверь что PyInstaller есть:
+
+```bash
+pyinstaller --version
+```
+
+Теперь запусти сборку через твой `.spec`-файл PyInstaller (не путать с RPM `.spec`!):
+
+```bash
+pyinstaller --clean --noconfirm AltPDF.spec
+```
+
+Подожди пока завершится. Потом проверь:
+
+```bash
+ls dist/
+```
+
+Ты должна увидеть файл `AltPDF`. Проверь что он работает:
+
+```bash
+./dist/AltPDF
+```
+
+Если приложение открылось — отлично! Закрой его и идём дальше.
+
+Деактивируй venv:
+
+```bash
+deactivate
+```
+
+---
+
+## 📁 Шаг 4 — Создать архив с нужными файлами
+
+RPM хочет получить `.tar.gz` архив с исходниками. Мы кладём туда всё что нужно для сборки.
+
+Убедись что ты в папке проекта:
+
+```bash
+pwd
+# должно быть что-то вроде /home/user/pdf_editor
+```
+
+Теперь создаём архив. Команда немного длинная, но давай разберём её:
+
+```bash
+tar -czf ~/rpmbuild/SOURCES/altpdf-0.831.tar.gz \
+    --transform 's|^|altpdf-0.831/|' \
+    dist/AltPDF \
+    icons/ \
+    help.pdf
+```
+
+**Что здесь происходит?**
+- `-czf` — создать сжатый архив
+- `~/rpmbuild/SOURCES/altpdf-0.831.tar.gz` — куда сохранить
+- `--transform 's|^|altpdf-0.831/|'` — это магия: она добавляет папку `altpdf-0.831/` внутри архива (RPM требует такую структуру)
+- дальше перечислены файлы которые берём
+
+Проверь что архив создан:
+
+```bash
+ls -lh ~/rpmbuild/SOURCES/
+```
+
+---
+
+## 📝 Шаг 5 — Обновить `.spec` файл
+
+Наш текущий `.spec` (тот что ты приложила) рассчитан на сборку из исходников через PyInstaller. Но это проблема: установка PySide6 через pip во время сборки пакета — занимает очень долго и требует интернета на сборочной машине.
+
+Более правильный подход — **положить уже готовый бинарник в архив** и в `.spec` просто его установить. Давай сделаем именно так:
+
+```bash
+nano ~/rpmbuild/SPECS/altpdf.spec
+```
+
+Вставь вот это содержимое (это упрощённая версия, без пересборки через PyInstaller):
+
+```spec
+Name:           altpdf
+Version:        0.831
+Release:        alt1
+Summary:        Редактор PDF файлов для Альт Рабочая станция
+License:        Proprietary
+Group:          Office
+URL:            https://sng.ru
+
+Source0:        %{name}-%{version}.tar.gz
+
+# PyInstaller уже включает Python и библиотеки внутри бинарника.
+# Нужны только базовые системные библиотеки:
+Requires:       libgcc1
+Requires:       glibc
+
+# Сборочных зависимостей почти нет — бинарник уже готов
+BuildArch:      x86_64
+
+%description
+Редактор PDF Альт — приложение для просмотра и редактирования PDF-файлов,
+разработанное для операционной системы Альт Рабочая станция.
+
+%prep
+%setup -q
+
+%build
+# Бинарник уже собран через PyInstaller — дополнительная сборка не нужна
+
+%install
+install -d %{buildroot}%{_bindir}
+install -d %{buildroot}%{_datadir}/%{name}
+install -d %{buildroot}%{_datadir}/applications
+install -d %{buildroot}%{_datadir}/icons/hicolor/256x256/apps
+
+# Устанавливаем готовый бинарник
+install -m 755 dist/AltPDF %{buildroot}%{_bindir}/altpdf
+
+# Устанавливаем help.pdf
+install -m 644 help.pdf %{buildroot}%{_datadir}/%{name}/help.pdf
+
+# Скрипт-обёртка (копирует help.pdf рядом с бинарником при первом запуске)
+cat > %{buildroot}%{_bindir}/altpdf-wrapper << 'EOF'
+#!/bin/sh
+HELP_SRC=%{_datadir}/%{name}/help.pdf
+HELP_DST=$(dirname $(readlink -f %{_bindir}/altpdf))/help.pdf
+[ -f "$HELP_DST" ] || cp "$HELP_SRC" "$HELP_DST" 2>/dev/null || true
+exec %{_bindir}/altpdf "$@"
+EOF
+chmod 755 %{buildroot}%{_bindir}/altpdf-wrapper
+
+# Ярлык в меню приложений
+cat > %{buildroot}%{_datadir}/applications/%{name}.desktop << 'EOF'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Редактор PDF Альт
+Name[ru]=Редактор PDF Альт
+Comment=Просмотр и редактирование PDF-документов
+Comment[ru]=Просмотр и редактирование PDF-документов
+Exec=altpdf-wrapper %F
+Icon=altpdf
+MimeType=application/pdf;
+Categories=Office;Viewer;
+StartupNotify=true
+EOF
+
+# Иконка
+if command -v convert >/dev/null 2>&1; then
+    convert icons/icon.ico[0] \
+        %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/altpdf.png 2>/dev/null || \
+    cp icons/icon.ico \
+        %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/altpdf.png
+else
+    cp icons/icon.ico \
+        %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/altpdf.png
+fi
+
+%post
+/usr/bin/gtk-update-icon-cache -f -t %{_datadir}/icons/hicolor 2>/dev/null || true
+/usr/bin/update-desktop-database %{_datadir}/applications 2>/dev/null || true
+
+%postun
+/usr/bin/gtk-update-icon-cache -f -t %{_datadir}/icons/hicolor 2>/dev/null || true
+/usr/bin/update-desktop-database %{_datadir}/applications 2>/dev/null || true
+
+%files
+%{_bindir}/altpdf
+%{_bindir}/altpdf-wrapper
+%{_datadir}/%{name}/help.pdf
+%{_datadir}/applications/%{name}.desktop
+%{_datadir}/icons/hicolor/256x256/apps/altpdf.png
+
+%changelog
+* Thu Apr 29 2026 ОППО ГИСиСАПР <dev@sng.ru> - 0.831-alt1
+- Initial RPM packaging for Альт Рабочая станция
+```
+
+Сохрани: `Ctrl+O`, `Enter`, `Ctrl+X`.
+
+---
+
+## 🔨 Шаг 6 — Собрать RPM пакет
+
+Теперь запускаем сборку! Команда `-bb` означает «собери только бинарный пакет» (без исходников):
+
+```bash
+rpmbuild -bb ~/rpmbuild/SPECS/altpdf.spec
+```
+
+Смотри на вывод. Если всё хорошо — в конце увидишь что-то вроде:
+
+```
+Wrote: /home/user/rpmbuild/RPMS/x86_64/altpdf-0.831-alt1.x86_64.rpm
+```
+
+Если увидела ошибки — скопируй их и покажи мне, разберёмся вместе!
+
+Проверь что пакет появился:
+
+```bash
+ls ~/rpmbuild/RPMS/x86_64/
+```
+
+---
+
+## 🧪 Шаг 7 — Проверить пакет перед установкой
+
+Посмотрим что внутри пакета (без установки):
+
+```bash
+rpm -qpl ~/rpmbuild/RPMS/x86_64/altpdf-0.831-alt1.x86_64.rpm
+```
+
+Это покажет список файлов которые войдут в систему при установке. Убедись что там есть `/usr/bin/altpdf`.
+
+---
+
+## 📥 Шаг 8 — Установить и протестировать
+
+```bash
+su
+```
+
+```bash
+rpm -ivh ~/rpmbuild/RPMS/x86_64/altpdf-0.831-alt1.x86_64.rpm
+```
+
+Флаги: `-i` установить, `-v` подробный вывод, `-h` прогресс-бар.
+
+Выйди из root:
+
+```bash
+exit
+```
+
+Проверь что программа запускается:
+
+```bash
+altpdf
+```
+
+И через ярлык — посмотри в меню приложений, там должен появиться «Редактор PDF Альт».
+
+---
+
+## ❌ Как удалить (для повторного тестирования)
+
+```bash
+su
+rpm -e altpdf
+exit
+```
+
+---
+
+## 🚚 Распространение на 1000 машин
+
+Когда пакет готов и протестирован — тебе нужно просто скопировать файл `altpdf-0.831-alt1.x86_64.rpm` на все машины и запустить `rpm -ivh altpdf-0.831-alt1.x86_64.rpm` (или через централизованную систему управления). Пакет самодостаточный — всё внутри.
+
+---
+
+## 🆘 Частые проблемы
+
+| Проблема | Что делать |
+|---|---|
+| `rpmbuild: command not found` | Установи `rpm-build` через `apt-get` |
+| Ошибка `%setup` — не может распаковать | Проверь что архив в `~/rpmbuild/SOURCES/` и имя совпадает с `Source0` в `.spec` |
+| `No such file: dist/AltPDF` | Проверь что в архив попал файл `dist/AltPDF` |
+| Программа запускается но падает | Скорее всего не хватает какой-то системной библиотеки — нужно добавить в `Requires` |
+
+---
+
+Попробуй пройти по шагам и на каком шаге что-то пойдёт не так — пиши! Я здесь 🙂
