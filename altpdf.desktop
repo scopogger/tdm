@@ -1,0 +1,21 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Редактор PDF Альт
+Name[ru]=Редактор PDF Альт
+Name[en]=AltPDF Editor
+GenericName=Просмотрщик PDF
+GenericName[ru]=Просмотрщик PDF
+GenericName[en]=PDF Viewer
+Comment=Просмотр и редактирование PDF-документов
+Comment[ru]=Просмотр и редактирование PDF-документов
+Comment[en]=View and edit PDF documents
+Exec=/opt/AltPDF/AltPDF %F
+Icon=altpdf
+MimeType=application/pdf;
+Categories=Office;Viewer;Graphics;
+StartupNotify=true
+StartupWMClass=AltPDF
+Keywords=PDF;документ;редактор;просмотр;
+Keywords[ru]=PDF;документ;редактор;просмотр;
+Keywords[en]=PDF;document;editor;viewer;
