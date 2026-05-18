@@ -11,17 +11,17 @@ from pathlib import Path
 from typing import Optional, List, Dict
 from PySide6.QtCore import (
     QThread, Signal, Qt, QMutex, QMutexLocker,
-    QPropertyAnimation, QEasingCurve, QRect, QTimer, QSize
+    QTimer
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QProgressBar, QTextEdit,
-    QCheckBox, QFileDialog, QMessageBox, QGroupBox, QListWidget,
+    QCheckBox, QFileDialog, QGroupBox, QListWidget,
     QListWidgetItem, QSizePolicy, QAbstractItemView, QFrame
 )
 from PySide6.QtGui import (
-    QFont, QTextCursor, QDragEnterEvent, QDropEvent,
-    QColor, QPalette, QLinearGradient, QGradient, QBrush
+    QTextCursor, QDragEnterEvent, QDropEvent,
+    QColor, QPalette
 )
 
 
@@ -263,22 +263,23 @@ class HashWorker(QThread):
 # ─── File row widget ───────────────────────────────────────────────────────────
 class FileRowWidget(QFrame):
     """
-    Expanded state  : number | icon | name | [copy-name] [copy-hash] [collapse] [remove]
-                      ── MD5:  xxxxxxxx
-                      ── SHA256: yyyyyyyy
+    Expanded state  : number | icon | name | [collapse] [remove]
+                      ── unified hash block (click → copies both MD5+SHA256)
     Collapsed state : number | icon | name | [expand] [remove]   (single line)
 
     Copy interactions:
-      • click filename label  → flash blue → copy filename to clipboard
-      • click hash label      → flash blue → copy that hash to clipboard
-      • when BOTH name+hash copied → 2s sweep animation → collapse row
+      • click filename label    → flash → copy filename
+      • click hash block        → flash → copy "MD5: xxx\nSHA256: yyy"
+      • when BOTH copied        → 2s sweep animation → auto-collapse
     """
     remove_requested = Signal(object)
 
-    _BASE_BG    = "#ffffff"
-    _FLASH_BG   = "#dde8ff"   # temporary copy flash
-    _SWEEP_BG   = "#c8d9ff"   # sweep animation color
-    _DONE_BG    = "#f5f8ff"   # resting collapsed bg
+    # zebra bg per even/odd row index (set at creation, index is 1-based)
+    _BG_ODD      = "#ffffff"
+    _BG_EVEN     = "#f7f8fc"
+    _BG_COLLAPSED_ODD  = "#edf0f8"
+    _BG_COLLAPSED_EVEN = "#e6eaf5"
+    _DONE_BG     = "#edf0f8"   # fallback for sweep-collapsed (odd-shade)
 
     def __init__(self, file_path: Path, index: int, parent=None):
         super().__init__(parent)
@@ -292,11 +293,29 @@ class FileRowWidget(QFrame):
         self._is_collapsed    = False
         self._sweep_timer     = None
         self._flash_timers: List[QTimer] = []
+        # reference back to the QListWidgetItem so we can update sizeHint
+        self._list_item: Optional[QListWidgetItem] = None
 
         self.setAutoFillBackground(True)
         self.setObjectName("fileRow")
-        self._set_bg(self._BASE_BG)
+        self._apply_row_bg()
         self._init_ui()
+
+    # ── background helper ──────────────────────────────────────────────────
+    def _apply_row_bg(self, collapsed: Optional[bool] = None):
+        """Set zebra bg. If collapsed is None, use current _is_collapsed."""
+        if collapsed is None:
+            collapsed = self._is_collapsed
+        is_even = (self.index % 2 == 0)
+        if collapsed:
+            color = self._BG_COLLAPSED_EVEN if is_even else self._BG_COLLAPSED_ODD
+        else:
+            color = self._BG_EVEN if is_even else self._BG_ODD
+        pal = self.palette()
+        pal.setColor(QPalette.Window, QColor(color))
+        self.setPalette(pal)
+        # clear any sweep stylesheet residue
+        self.setStyleSheet("")
 
     # ── UI construction ────────────────────────────────────────────────────
     def _init_ui(self):
@@ -341,23 +360,29 @@ class FileRowWidget(QFrame):
 
         self._outer.addLayout(self._top_row)
 
-        # ── Hash sub-row ────────────────────────────────────────────────────
+        # ── Hash block – single clickable widget, two lines ────────────────
         self._hash_frame = QWidget()
+        self._hash_frame.setCursor(Qt.PointingHandCursor)
+        self._hash_frame.setToolTip("Click to copy MD5 + SHA256")
+        self._hash_frame.mousePressEvent = lambda e: self._on_copy_hashes()
+
         hash_layout = QVBoxLayout(self._hash_frame)
-        hash_layout.setContentsMargins(52, 0, 0, 2)
+        hash_layout.setContentsMargins(52, 2, 8, 2)
         hash_layout.setSpacing(2)
 
-        self._md5_lbl = QLabel("MD5:  —")
-        self._sha256_lbl = QLabel("SHA256:  —")
+        mono_style = (
+            "font-family: 'Consolas','JetBrains Mono','Courier New',monospace;"
+            "font-size: 11px; color: #555; padding: 1px 4px;"
+            "background: transparent;"
+        )
+
+        self._md5_lbl = QLabel("MD5  —")
+        self._sha256_lbl = QLabel("SHA256  —")
         for lbl in (self._md5_lbl, self._sha256_lbl):
-            lbl.setStyleSheet(
-                "font-family: 'Consolas','JetBrains Mono','Courier New',monospace;"
-                "font-size: 11px; color: #555; padding: 1px 0;"
-            )
-            lbl.setCursor(Qt.PointingHandCursor)
+            lbl.setStyleSheet(mono_style)
             lbl.setWordWrap(False)
-        self._md5_lbl.mousePressEvent    = lambda e: self._on_copy_hash("md5")
-        self._sha256_lbl.mousePressEvent = lambda e: self._on_copy_hash("sha256")
+            # forward mouse press to parent block handler
+            lbl.mousePressEvent = lambda e: self._on_copy_hashes()
 
         hash_layout.addWidget(self._md5_lbl)
         hash_layout.addWidget(self._sha256_lbl)
@@ -393,26 +418,41 @@ class FileRowWidget(QFrame):
 
     # ── Hash population ────────────────────────────────────────────────────
     def set_hashes(self, md5: str, sha256: str):
-        self.md5  = md5.upper() if md5  not in ("", "ERROR") else md5
+        self.md5    = md5.upper()    if md5    not in ("", "ERROR") else md5
         self.sha256 = sha256.upper() if sha256 not in ("", "ERROR") else sha256
         self.hashes_ready = True
+
         self._md5_lbl.setText(
-            f"<span style='color:#888'>MD5</span>&nbsp;&nbsp; {self._fmt(self.md5)}"
+            f"<span style='color:#999;font-size:10px'>MD5&nbsp;&nbsp;&nbsp;</span>"
+            f"&nbsp;{self._fmt(self.md5)}"
         )
         self._sha256_lbl.setText(
-            f"<span style='color:#888'>SHA256</span> {self._fmt(self.sha256)}"
+            f"<span style='color:#999;font-size:10px'>SHA256</span>"
+            f"&nbsp;{self._fmt(self.sha256)}"
         )
         self._md5_lbl.setTextFormat(Qt.RichText)
         self._sha256_lbl.setTextFormat(Qt.RichText)
 
-        # Reset copy state whenever new hashes arrive
-        self._name_copied = False
-        self._hash_copied = False
+        # Reset copy state only if not already collapsed
+        if not self._is_collapsed:
+            self._name_copied = False
+            self._hash_copied = False
+
+        # Always refresh the list item size after content change
+        self._refresh_item_size()
 
     def _fmt(self, val: str) -> str:
         if val == "ERROR":
             return "<span style='color:#e53e3e'>ERROR</span>"
-        return f"<span style='color:#333;font-weight:500'>{val}</span>"
+        if not val:
+            return "<span style='color:#bbb'>—</span>"
+        return f"<span style='color:#2a2a3a;font-weight:500'>{val}</span>"
+
+    # ── Size hint refresh ──────────────────────────────────────────────────
+    def _refresh_item_size(self):
+        """Tell the QListWidget to recalculate this item's height."""
+        if self._list_item is not None:
+            self._list_item.setSizeHint(self.sizeHint())
 
     # ── Copy interactions ──────────────────────────────────────────────────
     def _on_copy_name(self):
@@ -421,27 +461,25 @@ class FileRowWidget(QFrame):
         self._name_copied = True
         self._check_both_copied()
 
-    def _on_copy_hash(self, which: str):
+    def _on_copy_hashes(self):
+        """Copy both MD5 and SHA256 together as formatted text."""
         if not self.hashes_ready:
             return
-        val = self.md5 if which == "md5" else self.sha256
-        if val in ("", "ERROR"):
+        if self.md5 in ("", "ERROR") and self.sha256 in ("", "ERROR"):
             return
-        QApplication.clipboard().setText(val)
-        lbl = self._md5_lbl if which == "md5" else self._sha256_lbl
-        self._flash_widget(lbl)
+        text = f"MD5: {self.md5}\nSHA256: {self.sha256}"
+        QApplication.clipboard().setText(text)
+        self._flash_widget(self._hash_frame)
         self._hash_copied = True
         self._check_both_copied()
 
-    def _flash_widget(self, widget: QLabel, duration_ms: int = 500):
-        """Brief blue background flash on the given label."""
-        orig = widget.styleSheet()
-        widget.setStyleSheet(
-            orig + "background-color: #c8d9ff; border-radius: 3px;"
-        )
+    def _flash_widget(self, widget, duration_ms: int = 500):
+        """Brief blue background flash on the given widget."""
+        orig_ss = widget.styleSheet()
+        widget.setStyleSheet(orig_ss + " background-color: #c8d9ff; border-radius: 4px;")
         t = QTimer(self)
         t.setSingleShot(True)
-        t.timeout.connect(lambda: widget.setStyleSheet(orig))
+        t.timeout.connect(lambda: widget.setStyleSheet(orig_ss))
         t.start(duration_ms)
         self._flash_timers.append(t)
 
@@ -452,13 +490,12 @@ class FileRowWidget(QFrame):
     # ── Sweep-then-collapse animation ─────────────────────────────────────
     def _start_sweep_collapse(self):
         """2-second right-to-left blue sweep, then collapse."""
-        # We'll do a timer-driven pseudo-sweep by animating background via
-        # stepping through stylesheet updates (Qt doesn't support gradient animation
-        # easily, so we simulate with a QTimer stepping the gradient position).
-        self._sweep_step = 0
-        self._sweep_total = 40   # steps over 2 seconds
+        if self._sweep_timer and self._sweep_timer.isActive():
+            return
+        self._sweep_step  = 0
+        self._sweep_total = 40   # 40 × 50ms = 2 s
         self._sweep_timer = QTimer(self)
-        self._sweep_timer.setInterval(50)   # 50ms × 40 = 2 s
+        self._sweep_timer.setInterval(50)
         self._sweep_timer.timeout.connect(self._sweep_tick)
         self._sweep_timer.start()
 
@@ -470,37 +507,30 @@ class FileRowWidget(QFrame):
             self._do_collapse()
             return
 
-        # progress 0→1 right-to-left:  highlight starts from right, sweeps to left
-        # We simulate with a gradient: at step=0 color is on the right;
-        # at step=total color is on the left; then collapse.
-        progress = step / total   # 0.0 → 1.0
-        # The "lit" portion grows from right: right side = 1.0, left = progress
-        pct_right = max(0, int((1.0 - progress) * 100))
-        pct_left  = 100 - pct_right
+        progress = step / total   # 0.0 → 1.0  (sweep moves left)
+        color_lit  = "#b8cdff"
+        color_base = self._BG_EVEN if (self.index % 2 == 0) else self._BG_ODD
 
-        color_lit = "#b8cdff"
-        color_base = "#ffffff"
-
-        if pct_left <= 0:
+        if progress <= 0:
             bg = f"background-color: {color_base};"
-        elif pct_right <= 0:
+        elif progress >= 1.0:
             bg = f"background-color: {color_lit};"
         else:
+            edge = min(progress + 0.06, 1.0)
             bg = (
                 f"background: qlineargradient("
-                f"x1:0, y1:0, x2:1, y2:0, "
-                f"stop:0 {color_lit}, "
-                f"stop:{progress:.3f} {color_lit}, "
-                f"stop:{min(progress+0.05,1):.3f} {color_base}, "
-                f"stop:1 {color_base}"
-                f");"
+                f"x1:0,y1:0,x2:1,y2:0,"
+                f"stop:0 {color_lit},"
+                f"stop:{progress:.3f} {color_lit},"
+                f"stop:{edge:.3f} {color_base},"
+                f"stop:1 {color_base});"
             )
 
         self.setStyleSheet(f"QFrame#fileRow {{ {bg} }}")
         self._sweep_step += 1
 
     def _do_collapse(self):
-        self.setStyleSheet(f"QFrame#fileRow {{ background-color: {self._DONE_BG}; }}")
+        self.setStyleSheet("")   # clear sweep stylesheet
         self._set_collapsed(True)
 
     # ── Toggle expand/collapse ─────────────────────────────────────────────
@@ -514,7 +544,7 @@ class FileRowWidget(QFrame):
             self._toggle_btn.setText("▼")
             self._toggle_btn.setToolTip("Expand")
             self._name_lbl.setStyleSheet(
-                "font-weight: 500; color: #6a7a9a; padding: 2px 0;"
+                "font-weight: 500; color: #8090b0; padding: 2px 0;"
             )
         else:
             self._toggle_btn.setText("▲")
@@ -522,19 +552,19 @@ class FileRowWidget(QFrame):
             self._name_lbl.setStyleSheet(
                 "font-weight: 500; color: #2d2d2d; padding: 2px 0;"
             )
-            # Reset copy state on re-expand
+            # Reset copy state on re-expand so sweep can trigger again
             self._name_copied = False
             self._hash_copied = False
 
-    # ── Helpers ────────────────────────────────────────────────────────────
-    def _set_bg(self, color: str):
-        pal = self.palette()
-        pal.setColor(QPalette.Window, QColor(color))
-        self.setPalette(pal)
+        self._apply_row_bg(collapsed)
+        # Critical: update item height so QListWidget allocates correct space
+        self._refresh_item_size()
 
+    # ── Helpers ────────────────────────────────────────────────────────────
     def update_index(self, idx: int):
         self.index = idx
         self._num_lbl.setText(f"{idx}.")
+        self._apply_row_bg()   # zebra stripes shift when rows are removed
 
 
 # ─── Main window ──────────────────────────────────────────────────────────────
@@ -689,6 +719,9 @@ class HashKitWindow(QMainWindow):
         item.setSizeHint(row.sizeHint())
         self._file_list.setItemWidget(item, row)
 
+        # Give the row a back-reference so it can update its own size hint
+        row._list_item = item
+
         # Update drop hint
         self._drop_hint.setVisible(len(self.file_paths) == 0)
         return 1
@@ -819,12 +852,7 @@ class HashKitWindow(QMainWindow):
         row = self.file_rows.get(path_str)
         if row:
             row.set_hashes(md5, sha256)
-            # Resize list item to fit new content
-            for i in range(self._file_list.count()):
-                item = self._file_list.item(i)
-                if self._file_list.itemWidget(item) is row:
-                    item.setSizeHint(row.sizeHint())
-                    break
+            # set_hashes calls _refresh_item_size internally
         self._log(f"✓ {Path(path_str).name}  md5={md5}  sha256={sha256}")
 
     def _on_error(self, path_str: str, msg: str):
