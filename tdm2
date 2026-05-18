@@ -1,1639 +1,602 @@
-import os
-import shutil
-import subprocess
+#!/usr/bin/env python3
+"""
+HashKit - File Hash Calculator with Modern UI
+Supports drag & drop, expandable file rows, MD5/SHA256 hashing, and live log.
+"""
+
+import hashlib
 import sys
-import tempfile
+import os
+from pathlib import Path
+from typing import Optional, List, Dict, Set
 from datetime import datetime
-from typing import List
-from classes.printing import PDFPrinter
-from classes.pages_range_dialog import PagesRangeDialog, ExportPagesDialog
-from classes.file_inserting import InsertFile
 
-# PySide6
+from PySide6.QtCore import QThread, Signal, Qt, QMutex, QMutexLocker
 from PySide6.QtWidgets import (
-    QFileDialog, QMessageBox, QProgressDialog, QApplication, QInputDialog, QLineEdit, QDialog, QVBoxLayout,
-    QRadioButton, QHBoxLayout, QLabel, QSpinBox, QDialogButtonBox, QPushButton, QComboBox
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QProgressBar, QTextEdit,
+    QCheckBox, QFileDialog, QMessageBox, QGroupBox, QListWidget,
+    QListWidgetItem, QScrollArea, QFrame, QSizePolicy, QAbstractItemView
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QImage
+from PySide6.QtGui import (
+    QFont, QTextCursor, QDragEnterEvent, QDropEvent, QClipboard,
+    QFontDatabase, QColor, QPalette
+)
 
-try:
-    import fitz  # PyMuPDF
-except Exception:  # pragma: no cover
-    fitz = None
-
-from settings_manager import settings_manager
+# Configuration
+HASH_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB buffer
 
 
-def messagebox_info(parent, title, message):
-    QMessageBox.information(parent, title, message)
+class HashWorker(QThread):
+    """Background worker that hashes a list of files."""
+    # Signals
+    file_started = Signal(str)           # file path (when processing begins)
+    file_progress = Signal(int, int)      # current index, total count
+    file_result = Signal(str, str, str)   # file_path, md5 (or empty), sha256 (or empty)
+    file_error = Signal(str, str)         # file_path, error message
+    finished = Signal(int, int)           # total files, error count
+    cancelled = Signal()
+
+    def __init__(self, file_list: List[Path], compute_md5: bool, compute_sha256: bool):
+        super().__init__()
+        self.file_list = file_list
+        self.compute_md5 = compute_md5
+        self.compute_sha256 = compute_sha256
+        self._is_cancelled = False
+        self._mutex = QMutex()
+
+    def cancel(self):
+        with QMutexLocker(self._mutex):
+            self._is_cancelled = True
+
+    def _is_cancelled_safe(self) -> bool:
+        with QMutexLocker(self._mutex):
+            return self._is_cancelled
+
+    def _hash_file(self, file_path: Path, algorithm: str) -> str:
+        """Hash a single file with chunked reading."""
+        hash_func = hashlib.md5() if algorithm == 'md5' else hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(HASH_BUFFER_SIZE), b''):
+                if self._is_cancelled_safe():
+                    raise InterruptedError("Cancelled")
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+
+    def run(self):
+        total = len(self.file_list)
+        error_count = 0
+
+        for idx, file_path in enumerate(self.file_list, start=1):
+            if self._is_cancelled_safe():
+                self.cancelled.emit()
+                return
+
+            self.file_progress.emit(idx, total)
+            self.file_started.emit(str(file_path))
+
+            md5_hash = ""
+            sha256_hash = ""
+
+            try:
+                if self.compute_md5:
+                    md5_hash = self._hash_file(file_path, 'md5').upper()
+                if self.compute_sha256:
+                    sha256_hash = self._hash_file(file_path, 'sha256').upper()
+                self.file_result.emit(str(file_path), md5_hash, sha256_hash)
+            except InterruptedError:
+                self.cancelled.emit()
+                return
+            except Exception as e:
+                error_count += 1
+                self.file_error.emit(str(file_path), str(e))
+                # Still emit result with error placeholders
+                self.file_result.emit(str(file_path), "ERROR", "ERROR")
+
+        self.finished.emit(total, error_count)
 
 
-class ActionsHandler:
-    """Wire up menus/toolbars and provide app actions compatible with the *new* UI
-    while preserving behavior from the *old* implementation where possible.
+class FileRowWidget(QWidget):
+    """Custom widget for each file in the list: expandable, shows hashes, copy button."""
+    copy_requested = Signal(str, str, str)   # file_path, md5, sha256
+    remove_requested = Signal(object)        # self (the row widget)
 
-    This class is defensive: it checks for the presence of attributes/methods
-    on ui widgets so it can work across slightly different PDFViewer/Thumbnail
-    implementations.
-    """
+    def __init__(self, file_path: Path, index: int, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.index = index
+        self.md5 = ""
+        self.sha256 = ""
+        self.is_expanded = True
+        self.hashes_ready = False
 
-    def __init__(self, main_window):
-        self.main_window = main_window
-        self.ui = main_window.ui
-        self.recent_file_actions: list[QAction] = []
+        self._init_ui()
+        self._set_expanded_state(True)
 
-        # self.ui.actionFitToWidth.setCheckable(True)
-        # self.ui.actionFitToHeight.setCheckable(True)
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(3)
 
-        self.connect_all_actions()
+        # Top row: number, icon, name, buttons
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
 
-        self.update_recent_files_menu()
+        # File number
+        self.num_label = QLabel(f"{self.index}.")
+        self.num_label.setFixedWidth(35)
+        top_row.addWidget(self.num_label)
 
-    # -----------------------------
-    # Wiring
-    # -----------------------------
-    def connect_all_actions(self):
-        """Connect all UI actions to their handlers"""
-        self.connect_file_actions()
-        self.connect_navigation_actions()
-        self.connect_page_actions()
-        self.connect_view_actions()
-        self.connect_panel_actions()
-        self.connect_recent_files_actions()
-        self.connect_print_actions()
-        self.connect_help_actions()
+        # Icon label (using emoji for simplicity; could use font icons)
+        self.icon_label = QLabel(self._get_file_icon())
+        self.icon_label.setFixedWidth(30)
+        top_row.addWidget(self.icon_label)
 
-    def connect_file_actions(self):
-        """Connect file menu actions"""
-        if hasattr(self.ui, 'actionOpen'):
-            self.ui.actionOpen.triggered.connect(self.open_file)
-        if hasattr(self.ui, 'actionSave'):
-            self.ui.actionSave.triggered.connect(self.save_file)
-        if hasattr(self.ui, 'actionSaveAs'):
-            self.ui.actionSaveAs.triggered.connect(self.save_file_as)
-        if hasattr(self.ui, 'actionClosePdf'):
-            self.ui.actionClosePdf.triggered.connect(self.close_file)
-        if hasattr(self.ui, 'actionQuit'):
-            self.ui.actionQuit.triggered.connect(self.main_window.close)
-        if hasattr(self.ui, 'actionPasswordDoc'):
-            self.ui.actionPasswordDoc.triggered.connect(self.toggle_password_for_current_document)
-        if hasattr(self.ui, 'actionAddFile'):
-            self.ui.actionAddFile.triggered.connect(self.add_file_to_document)
-        if hasattr(self.ui, 'actionEmail'):
-            self.ui.actionEmail.triggered.connect(self.email_document)
-        if hasattr(self.ui, 'actionCompress'):
-            self.ui.actionCompress.triggered.connect(self.compress_pdf)
+        # File name (no path)
+        self.name_label = QLabel(self.file_path.name)
+        self.name_label.setWordWrap(False)
+        self.name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        top_row.addWidget(self.name_label)
 
-    def connect_navigation_actions(self):
-        """Connect navigation actions"""
-        if hasattr(self.ui, 'actionPrevious_Page'):
-            self.ui.actionPrevious_Page.triggered.connect(self.previous_page)
-        if hasattr(self.ui, 'actionNext_Page'):
-            self.ui.actionNext_Page.triggered.connect(self.next_page)
-        if hasattr(self.ui, 'actionJumpToFirstPage'):
-            self.ui.actionJumpToFirstPage.triggered.connect(self.jump_to_first_page)
-        if hasattr(self.ui, 'actionJumpToLastPage'):
-            self.ui.actionJumpToLastPage.triggered.connect(self.jump_to_last_page)
+        # Copy button (only visible when expanded and hashes ready)
+        self.copy_btn = QPushButton("📋")
+        self.copy_btn.setFixedSize(30, 30)
+        self.copy_btn.setToolTip("Copy MD5 and SHA256")
+        self.copy_btn.clicked.connect(self._on_copy)
+        top_row.addWidget(self.copy_btn)
 
-    def connect_page_actions(self):
-        """Connect page manipulation actions"""
-        if hasattr(self.ui, 'actionDeletePage'):
-            self.ui.actionDeletePage.triggered.connect(lambda checked=False: self.delete_pages(current_page=True))
-        if hasattr(self.ui, 'actionDeleteSpecificPages'):
-            self.ui.actionDeleteSpecificPages.triggered.connect(lambda checked=False: self.delete_pages(current_page=False))
-        if hasattr(self.ui, 'actionMovePageUp'):
-            self.ui.actionMovePageUp.triggered.connect(self.move_page_up)
-        if hasattr(self.ui, 'actionMovePageDown'):
-            self.ui.actionMovePageDown.triggered.connect(self.move_page_down)
-        if hasattr(self.ui, 'actionRotateCurrentPageClockwise'):
-            self.ui.actionRotateCurrentPageClockwise.triggered.connect(self.rotate_page_clockwise)
-        if hasattr(self.ui, 'actionRotateCurrentPageCounterclockwise'):
-            self.ui.actionRotateCurrentPageCounterclockwise.triggered.connect(self.rotate_page_counterclockwise)
-        if hasattr(self.ui, 'actionExport_Pages'):
-            self.ui.actionExport_Pages.triggered.connect(self.export_pages)
-        if hasattr(self.ui, 'actionEnumeratePages'):
-            self.ui.actionEnumeratePages.triggered.connect(self.enumerate_pages)
+        # Expand/collapse button
+        self.toggle_btn = QPushButton("▲")
+        self.toggle_btn.setFixedSize(30, 30)
+        self.toggle_btn.setToolTip("Collapse")
+        self.toggle_btn.clicked.connect(self._on_toggle)
+        top_row.addWidget(self.toggle_btn)
 
-    def connect_help_actions(self):
-        """Connect help menu actions"""
-        if hasattr(self.ui, 'actionAboutPdf'):
-            self.ui.actionAboutPdf.triggered.connect(self.show_pdf_info)
-        if hasattr(self.ui, 'actionAbout'):
-            self.ui.actionAbout.triggered.connect(self.show_about)
+        # Remove button
+        self.remove_btn = QPushButton("✖")
+        self.remove_btn.setFixedSize(30, 30)
+        self.remove_btn.setToolTip("Remove from list")
+        self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        top_row.addWidget(self.remove_btn)
 
-    def connect_view_actions(self):
-        """Connect view actions"""
-        if hasattr(self.ui, 'actionZoom_In'):
-            self.ui.actionZoom_In.triggered.connect(self.zoom_in)
-        if hasattr(self.ui, 'actionZoom_Out'):
-            self.ui.actionZoom_Out.triggered.connect(self.zoom_out)
-        if hasattr(self.ui, 'actionFitToWidth'):
-            self.ui.actionFitToWidth.triggered.connect(self.fit_to_width)
-        if hasattr(self.ui, 'actionFitToHeight'):
-            self.ui.actionFitToHeight.triggered.connect(self.fit_to_height)
-        if hasattr(self.ui, 'actionRotateViewClockwise'):
-            self.ui.actionRotateViewClockwise.triggered.connect(self.rotate_view_clockwise)
-        if hasattr(self.ui, 'actionRotateViewCounterclockwise'):
-            self.ui.actionRotateViewCounterclockwise.triggered.connect(self.rotate_view_counterclockwise)
+        layout.addLayout(top_row)
 
-    def connect_panel_actions(self):
-        """Connect panel actions"""
-        if hasattr(self.ui, 'actionToggle_Panel'):
-            self.ui.actionToggle_Panel.triggered.connect(self.toggle_side_panel)
+        # Bottom row (hash info, visible only when expanded)
+        self.hash_widget = QWidget()
+        hash_layout = QHBoxLayout(self.hash_widget)
+        hash_layout.setContentsMargins(35, 0, 0, 0)  # indent
+        self.md5_label = QLabel("MD5: ")
+        self.sha256_label = QLabel("SHA256: ")
+        hash_layout.addWidget(self.md5_label)
+        hash_layout.addWidget(self.sha256_label)
+        hash_layout.addStretch()
+        layout.addWidget(self.hash_widget)
 
-    def connect_recent_files_actions(self):
-        # submenu exists in the new UI
-        if hasattr(self.ui, 'actionClearRecentFiles'):
-            self.ui.actionClearRecentFiles.triggered.connect(self.clear_recent_files)
+        self.setAutoFillBackground(True)
 
-    def connect_print_actions(self):
-        """Connect printing actions"""
-        if hasattr(self.ui, 'actionPrint'):
-            self.ui.actionPrint.triggered.connect(self.print_document)
-
-    def toggle_password_for_current_document(self):
-        """If current document has password -> ask to remove, else ask to set a new password."""
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv or not getattr(pv, 'doc_path', None):
-            messagebox_info(self.main_window, "Внимание", "Сначала откройте документ.")
-            return
-
-        doc_path = pv.doc_path
-        current_pw = getattr(pv, 'document_password', "") or ""
-
-        if current_pw:
-            # Есть пароль — предложить удалить
-            reply = QMessageBox.question(
-                self.main_window,
-                "Удалить пароль",
-                "Документ защищён паролем. Удалить пароль (разблокировать файл)?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                ok = self._remove_password_for_file(doc_path, current_pw)
-                if ok:
-                    settings_manager.remove_encryption_password(doc_path)
-                    messagebox_info(self.main_window, "Готово", "Пароль удалён и документ перезагружен.")
-                    # Перезагружаем документ в UI (viewer + thumbnails)
-                    try:
-                        self.main_window.load_document(doc_path)
-                    except Exception:
-                        pass
-                else:
-                    QMessageBox.critical(self.main_window, "Ошибка",
-                                         "Не удалось удалить пароль. Проверьте текущий пароль.")
+    def _get_file_icon(self) -> str:
+        """Return an emoji icon based on file extension."""
+        ext = self.file_path.suffix.lower()
+        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
+            return "🖼️"
+        elif ext in ['.mp4', '.mkv', '.avi', '.mov']:
+            return "🎬"
+        elif ext in ['.mp3', '.wav', '.flac']:
+            return "🎵"
+        elif ext in ['.pdf']:
+            return "📄"
+        elif ext in ['.doc', '.docx']:
+            return "📝"
+        elif ext in ['.zip', '.rar', '.7z', '.tar', '.gz']:
+            return "🗜️"
+        elif ext in ['.exe', '.msi']:
+            return "⚙️"
+        elif ext in ['.py', '.js', '.html', '.css', '.cpp', '.c']:
+            return "💻"
         else:
-            # Нет пароля — предложить задать
-            pw, ok = QInputDialog.getText(self.main_window, "Установить пароль", "Введите новый пароль:",
-                                          QLineEdit.Password)
-            if not ok or not pw:
-                return
-            pw2, ok2 = QInputDialog.getText(self.main_window, "Подтверждение пароля", "Повторите пароль:",
-                                            QLineEdit.Password)
-            if not ok2 or pw != pw2:
-                QMessageBox.warning(self.main_window, "Ошибка", "Пароли не совпадают или пустые.")
-                return
+            return "📁"
 
-            success = self._set_password_for_file(doc_path, pw, current_password_hint=current_pw)
-            if success:
-                # Пометить (опционально) в настройках
-                try:
-                    settings_manager.save_encryption_password(doc_path, pw)
-                except Exception:
-                    pass
-                messagebox_info(self.main_window, "Готово", "Пароль установлен и документ перезагружен.")
-                try:
-                    self.main_window.load_document(doc_path)
-                except Exception:
-                    pass
-            else:
-                QMessageBox.critical(self.main_window, "Ошибка", "Не удалось установить пароль для файла.")
+    def set_hashes(self, md5: str, sha256: str):
+        self.md5 = md5.upper() if md5 and md5 != "ERROR" else md5
+        self.sha256 = sha256.upper() if sha256 and sha256 != "ERROR" else sha256
+        self.hashes_ready = True
+        self.md5_label.setText(f"MD5: {self.md5}")
+        self.sha256_label.setText(f"SHA256: {self.sha256}")
+        # Enable copy button only if expanded and hashes are valid (not ERROR)
+        if self.is_expanded and self.md5 != "ERROR" and self.sha256 != "ERROR":
+            self.copy_btn.setEnabled(True)
+        else:
+            self.copy_btn.setEnabled(False)
 
-    def _set_password_for_file(self, file_path: str, new_password: str, current_password_hint: str = "") -> bool:
-        """Save a password-protected copy over the original file.
-        Strategy: open original with PyMuPDF (authenticate if needed), save to temp with encryption, replace file.
-        """
-        if fitz is None:
-            QMessageBox.critical(self.main_window, "Ошибка", "PyMuPDF (fitz) не установлен — операция недоступна.")
-            return False
-
-        try:
-            doc = fitz.open(file_path)
-            if doc.needs_pass and current_password_hint:
-                if not doc.authenticate(current_password_hint):
-                    doc.close()
-                    return False
-
-            # Save to temp file with AES-256 encryption (owner & user same for simplicity)
-            fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
-            os.close(fd)
-            try:
-                # PyMuPDF encryption constants: fitz.PDF_ENCRYPT_AES_256
-                # Use owner_pw and user_pw parameters.
-                doc.save(tmp_path, encryption=fitz.PDF_ENCRYPT_AES_256, owner_pw=new_password, user_pw=new_password)
-            except TypeError:
-                # Older PyMuPDF signature fallback
-                try:
-                    doc.save(tmp_path, encryption=fitz.PDF_ENCRYPT_AES_256)
-                    # If API doesn't accept owner_pw/user_pw, we can't set password reliably
-                    doc.close()
-                    return False
-                except Exception as e:
-                    doc.close()
-                    print("save encryption failed:", e)
-                    return False
-            finally:
-                doc.close()
-
-            # Replace original with temp (atomic)
-            shutil.move(tmp_path, file_path)
-            return True
-
-        except Exception as e:
-            print(f"_set_password_for_file error: {e}")
-            return False
-
-    def _remove_password_for_file(self, file_path: str, current_password: str) -> bool:
-        """Remove password by opening and saving plain copy, then replacing original."""
-        if fitz is None:
-            QMessageBox.critical(self.main_window, "Ошибка", "PyMuPDF (fitz) не установлен — операция недоступна.")
-            return False
-
-        try:
-            doc = fitz.open(file_path)
-            if doc.needs_pass:
-                if not doc.authenticate(current_password):
-                    doc.close()
-                    return False
-
-            fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
-            os.close(fd)
-            try:
-                # Save without encryption
-                doc.save(tmp_path)
-            finally:
-                doc.close()
-
-            shutil.move(tmp_path, file_path)
-            return True
-
-        except Exception as e:
-            print(f"_remove_password_for_file error: {e}")
-            return False
-
-    def add_file_to_document(self):
-        """Append another PDF to the current document and display the merged result"""
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv or not getattr(pv, 'document', None):
-            QMessageBox.warning(self.main_window, "Нет документа", "Пожалуйста сначала откройте PDF документ.")
+    def _on_copy(self):
+        if not self.hashes_ready or not self.is_expanded:
             return
-        inserting = InsertFile(self.main_window, self.ui, pv)
-        inserting.add_file_to_document()
-        return
+        # Copy both hashes to clipboard
+        clipboard = QApplication.clipboard()
+        text = f"MD5: {self.md5}\nSHA256: {self.sha256}"
+        clipboard.setText(text)
+        # Auto-collapse after copy
+        self._set_expanded_state(False)
+        # Emit a signal to notify parent? Not needed, but can show status
+        parent = self.parent()
+        while parent and not isinstance(parent, QMainWindow):
+            parent = parent.parent()
+        if parent:
+            parent.statusBar().showMessage("Hashes copied, row collapsed", 2000)
 
-    # -----------------------------
-    # Helpers for page visibility/order (compatible with old & new viewers)
-    # -----------------------------
-    def get_visible_pages_in_layout_order(self) -> List[int]:
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv:
-            return []
+    def _on_toggle(self):
+        self._set_expanded_state(not self.is_expanded)
 
-        total = pv.document.current_doc.page_count
-        return list(range(total)) if total else []
+    def _set_expanded_state(self, expanded: bool):
+        self.is_expanded = expanded
+        self.hash_widget.setVisible(expanded)
+        if expanded:
+            self.toggle_btn.setText("▲")
+            self.toggle_btn.setToolTip("Collapse")
+            # Restore normal appearance
+            pal = self.palette()
+            pal.setColor(QPalette.Window, QColor(255, 255, 255))
+            self.setPalette(pal)
+            self.name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            # Show copy button only if hashes are ready and not errors
+            if self.hashes_ready and self.md5 != "ERROR" and self.sha256 != "ERROR":
+                self.copy_btn.setVisible(True)
+                self.copy_btn.setEnabled(True)
+            else:
+                self.copy_btn.setVisible(False)
+        else:
+            self.toggle_btn.setText("▼")
+            self.toggle_btn.setToolTip("Expand")
+            # Gray out and disable text selection
+            pal = self.palette()
+            gray_color = QColor(180, 180, 180)
+            pal.setColor(QPalette.Window, QColor(240, 240, 240))
+            pal.setColor(QPalette.WindowText, gray_color)
+            self.setPalette(pal)
+            self.num_label.setPalette(pal)
+            self.icon_label.setPalette(pal)
+            self.name_label.setPalette(pal)
+            self.name_label.setTextInteractionFlags(Qt.NoTextInteraction)
+            self.copy_btn.setVisible(False)
 
-    def _get_total_pages(self) -> int:
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv:
+
+class HashKitWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.worker: Optional[HashWorker] = None
+        self.file_rows: Dict[str, FileRowWidget] = {}  # path -> row widget
+        self.file_paths: List[Path] = []               # ordered list
+        self.output_path: Optional[Path] = None
+        self.compute_md5 = True
+        self.compute_sha256 = True
+        self._init_ui()
+        self.setAcceptDrops(True)
+
+    def _init_ui(self):
+        self.setWindowTitle("HashKit - File Hash Calculator")
+        self.setMinimumSize(900, 700)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+
+        # Output file selection row
+        out_layout = QHBoxLayout()
+        out_layout.addWidget(QLabel("Save results:"))
+        self.output_line = QLineEdit()
+        self.output_line.setReadOnly(True)
+        self.output_line.setPlaceholderText("Select output file...")
+        out_layout.addWidget(self.output_line)
+        self.browse_out_btn = QPushButton("Browse")
+        self.browse_out_btn.clicked.connect(self._browse_output)
+        out_layout.addWidget(self.browse_out_btn)
+        main_layout.addLayout(out_layout)
+
+        # Options row: MD5/SHA256 toggles, Clear All, Show Live Log
+        opts_layout = QHBoxLayout()
+        self.md5_cb = QCheckBox("MD5")
+        self.md5_cb.setChecked(True)
+        self.sha256_cb = QCheckBox("SHA256")
+        self.sha256_cb.setChecked(True)
+        self.md5_cb.toggled.connect(self._update_hash_options)
+        self.sha256_cb.toggled.connect(self._update_hash_options)
+        self.clear_all_btn = QPushButton("Clear All")
+        self.clear_all_btn.clicked.connect(self._clear_all_files)
+        self.live_log_toggle = QCheckBox("Show Live Log")
+        self.live_log_toggle.setChecked(False)
+        self.live_log_toggle.toggled.connect(self._toggle_live_log)
+        opts_layout.addWidget(self.md5_cb)
+        opts_layout.addWidget(self.sha256_cb)
+        opts_layout.addStretch()
+        opts_layout.addWidget(self.clear_all_btn)
+        opts_layout.addWidget(self.live_log_toggle)
+        main_layout.addLayout(opts_layout)
+
+        # File list (scrollable)
+        self.file_list_widget = QListWidget()
+        self.file_list_widget.setDragEnabled(False)
+        self.file_list_widget.setAcceptDrops(True)
+        self.file_list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.file_list_widget.setDropIndicatorShown(True)
+        self.file_list_widget.viewport().setAcceptDrops(True)
+        self.file_list_widget.setDragDropMode(QAbstractItemView.InternalMove)  # not used
+        main_layout.addWidget(QLabel("Files to process (drag & drop files/folders here):"))
+        main_layout.addWidget(self.file_list_widget)
+
+        # Live log (initially hidden)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9))
+        self.log_text.setVisible(False)
+        main_layout.addWidget(self.log_text)
+
+        # Progress area
+        progress_group = QGroupBox("Progress")
+        prog_layout = QVBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.current_file_label = QLabel("Ready")
+        self.current_file_label.setWordWrap(True)
+        prog_layout.addWidget(self.progress_bar)
+        prog_layout.addWidget(self.current_file_label)
+        progress_group.setLayout(prog_layout)
+        main_layout.addWidget(progress_group)
+
+        # Start / Cancel buttons
+        btn_layout = QHBoxLayout()
+        self.start_btn = QPushButton("Start Hashing")
+        self.start_btn.clicked.connect(self._start_hashing)
+        self.start_btn.setEnabled(False)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self._cancel_hashing)
+        self.cancel_btn.setEnabled(False)
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addStretch()
+        main_layout.addLayout(btn_layout)
+
+        self.statusBar().showMessage("Drag and drop files/folders or select output file first")
+
+    def _browse_output(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Results As", "", "Text Files (*.txt)")
+        if path:
+            self.output_path = Path(path)
+            self.output_line.setText(str(self.output_path))
+            self._update_start_button()
+
+    def _update_hash_options(self):
+        self.compute_md5 = self.md5_cb.isChecked()
+        self.compute_sha256 = self.sha256_cb.isChecked()
+        self._update_start_button()
+
+    def _update_start_button(self):
+        enabled = (len(self.file_paths) > 0 and self.output_path is not None and
+                   (self.compute_md5 or self.compute_sha256))
+        self.start_btn.setEnabled(enabled)
+
+    def _clear_all_files(self):
+        self.file_list_widget.clear()
+        self.file_rows.clear()
+        self.file_paths.clear()
+        self._update_start_button()
+        self.statusBar().showMessage("Cleared all files")
+
+    def _toggle_live_log(self, checked):
+        self.log_text.setVisible(checked)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event: QDropEvent):
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        added_count = 0
+        for url in urls:
+            path = Path(url.toLocalFile())
+            if path.exists():
+                if path.is_file():
+                    added_count += self._add_file(path)
+                elif path.is_dir():
+                    added_count += self._add_folder(path)
+        if added_count > 0:
+            self._update_start_button()
+            self.statusBar().showMessage(f"Added {added_count} new file(s)", 3000)
+        event.acceptProposedAction()
+
+    def _add_file(self, file_path: Path) -> int:
+        """Add a single file to the list if not already present."""
+        str_path = str(file_path.resolve())
+        if str_path in self.file_rows:
             return 0
-        if hasattr(pv, 'get_total_pages'):
-            try:
-                return int(pv.get_total_pages())
-            except Exception:
-                pass
-        if hasattr(pv, 'page_widgets') and pv.page_widgets is not None:
-            return len(pv.page_widgets)
-        if hasattr(pv, 'document') and pv.document is not None:
-            try:
-                return len(pv.document)
-            except Exception:
-                return 0
-        return 0
+        self.file_paths.append(file_path)
+        row_widget = FileRowWidget(file_path, len(self.file_paths))
+        row_widget.remove_requested.connect(self._remove_row)
+        # Store for later updates
+        self.file_rows[str_path] = row_widget
+        # Insert into QListWidget
+        item = QListWidgetItem()
+        self.file_list_widget.addItem(item)
+        item.setSizeHint(row_widget.sizeHint())
+        self.file_list_widget.setItemWidget(item, row_widget)
+        return 1
 
-    # -----------------------------
-    # Recent files
-    # -----------------------------
-    def update_recent_files_menu(self):
-        menu = getattr(self.ui, 'menuOpenRecent', None)
-        if not menu:
+    def _add_folder(self, folder_path: Path) -> int:
+        """Recursively add all files from folder."""
+        added = 0
+        for file_path in folder_path.rglob("*"):
+            if file_path.is_file():
+                added += self._add_file(file_path)
+        return added
+
+    def _remove_row(self, row_widget: FileRowWidget):
+        """Remove a file row from the list."""
+        path_str = str(row_widget.file_path.resolve())
+        if path_str in self.file_rows:
+            del self.file_rows[path_str]
+        # Remove from file_paths list
+        for i, p in enumerate(self.file_paths):
+            if str(p.resolve()) == path_str:
+                self.file_paths.pop(i)
+                break
+        # Remove from list widget
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            if self.file_list_widget.itemWidget(item) == row_widget:
+                self.file_list_widget.takeItem(i)
+                break
+        # Renumber remaining rows
+        self._renumber_rows()
+        self._update_start_button()
+        self.statusBar().showMessage("File removed", 2000)
+
+    def _renumber_rows(self):
+        """Update the index numbers on all rows after removal."""
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            widget = self.file_list_widget.itemWidget(item)
+            if isinstance(widget, FileRowWidget):
+                widget.index = i + 1
+                widget.num_label.setText(f"{widget.index}.")
+
+    def _start_hashing(self):
+        if not self.file_paths or not self.output_path:
+            return
+        if not (self.compute_md5 or self.compute_sha256):
+            QMessageBox.warning(self, "Warning", "Select at least one hash algorithm")
             return
 
-        # Remove previous actions we added
-        for act in self.recent_file_actions:
-            try:
-                menu.removeAction(act)
-                act.deleteLater()
-            except Exception:
-                pass
-        self.recent_file_actions.clear()
+        # Disable UI
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.clear_all_btn.setEnabled(False)
+        self.browse_out_btn.setEnabled(False)
+        self.md5_cb.setEnabled(False)
+        self.sha256_cb.setEnabled(False)
+        self.file_list_widget.setAcceptDrops(False)
 
-        recent_files = settings_manager.get_recent_files() or []
-        max_items = getattr(settings_manager, 'MAX_RECENT_FILES', 10)
+        # Clear any existing hashes in rows (but keep rows)
+        for row in self.file_rows.values():
+            row.set_hashes("", "")
+            row.hashes_ready = False
 
-        if not recent_files:
-            action = QAction("Нет недавних файлов", menu)
-            action.setEnabled(False)
-            menu.addAction(action)
-            self.recent_file_actions.append(action)
-            return
+        self.progress_bar.setValue(0)
+        self.current_file_label.setText("Starting...")
 
-        for i, file_path in enumerate(recent_files[:max_items]):
-            text = f"{i + 1}. {os.path.basename(file_path)}"
-            act = QAction(text, menu)
-            act.setToolTip(file_path)
-            # capture path correctly at definition time
-            act.triggered.connect(lambda checked=False, p=file_path: self.open_recent_file(p))
-            menu.addAction(act)
-            self.recent_file_actions.append(act)
+        # Create worker with current file list
+        self.worker = HashWorker(self.file_paths, self.compute_md5, self.compute_sha256)
+        self.worker.file_started.connect(self._on_file_started)
+        self.worker.file_progress.connect(self._on_progress)
+        self.worker.file_result.connect(self._on_file_result)
+        self.worker.file_error.connect(self._on_file_error)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.cancelled.connect(self._on_cancelled)
+        self.worker.start()
 
-        # trailing separator + clear action if available
-        clear_act = getattr(self.ui, 'actionClearRecentFiles', None)
-        if clear_act:
-            menu.addSeparator()
-            menu.addAction(clear_act)
+    def _cancel_hashing(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.statusBar().showMessage("Cancelling...")
 
-    def open_recent_file(self, file_path: str):
-        if not os.path.exists(file_path):
-            QMessageBox.warning(
-                self.main_window,
-                "Файл не найден",
-                f"Файла '{file_path}' больше не существует."
-            )
-            settings_manager.remove_recent_file(file_path)
-            self.update_recent_files_menu()
-            return
-
-        # Check if a document is currently open
-        pv = getattr(self.ui, 'pdfView', None)
-        has_open_doc = bool(pv and hasattr(pv, 'document') and pv.document is not None)
-
-        # If no doc is open -> just load (no prompt needed)
-        if not has_open_doc:
-            self.main_window.load_document(file_path)
-            return
-
-        # Ask the user how to open the file
-        choice = self._ask_open_window_choice()
-        if choice == "same":
-            # Load in current window
-            self.main_window.load_document(file_path)
-        elif choice == "new":
-            # Launch new instance
-            self._launch_new_instance(file_path)
-        else:
-            # User cancelled → do nothing (keep current doc)
-            pass
-
-    def clear_recent_files(self):
-        reply = QMessageBox.question(
-            self.main_window,
-            "Удалить недавние",
-            "Очистить список недавних файлов?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply == QMessageBox.Yes:
-            settings_manager.clear_recent_files()
-            self.update_recent_files_menu()
-
-    # -----------------------------
-    # File operations
-    # -----------------------------
-
-    def open_file(self):
-        if getattr(self.main_window, 'is_document_modified', False):
-            reply = self.main_window.ask_save_changes()
-            if reply == QMessageBox.Cancel:
-                return
-            if reply == QMessageBox.Save and not self.save_file():
-                return
-
-        last_dir = settings_manager.get_last_directory()
-        file_path, _ = QFileDialog.getOpenFileName(
-            self.main_window,
-            "Open PDF",
-            last_dir,
-            "PDF Files (*.pdf)"
-        )
-        if not file_path:
-            return
-
-        # Save path and recent file (this happens regardless of window choice)
-        settings_manager.save_last_directory(os.path.dirname(file_path))
-        settings_manager.add_recent_file(file_path)
-        self.update_recent_files_menu()
-
-        # Check if a document is currently open
-        pv = getattr(self.ui, 'pdfView', None)
-        has_open_doc = bool(pv and hasattr(pv, 'document') and pv.document is not None)
-
-        if not has_open_doc:
-            # No document open -> just load normally
-            self.main_window.load_document(file_path)
-            return
-
-        # Ask the user how to open the file
-        choice = self._ask_open_window_choice()
-        if choice == "same":
-            self.main_window.load_document(file_path)
-        elif choice == "new":
-            self._launch_new_instance(file_path)
-        else:
-            pass
-
-    def _ask_open_window_choice(self) -> str:
-        dialog = QDialog(self.main_window)
-        dialog.setWindowTitle("Открыть документ")
-        dialog.setModal(True)
-
-        layout = QVBoxLayout()
-
-        label = QLabel("Документ уже открыт. Как открыть новый файл?")
-        label.setWordWrap(True)
-        layout.addWidget(label)
-
-        same_radio = QRadioButton("Открыть в текущем окне")
-        same_radio.setChecked(True)
-        new_radio = QRadioButton("Открыть в новом окне")
-
-        layout.addWidget(same_radio)
-        layout.addWidget(new_radio)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        dialog.setLayout(layout)
-
-        if dialog.exec() != QDialog.Accepted:
-            return ""
-
-        return "same" if same_radio.isChecked() else "new"
-
-    def _launch_new_instance(self, file_path: str):
-        try:
-            # Get the path to the executable/script
-            if getattr(sys, 'frozen', False):
-                # Running as bundled app (PyInstaller)
-                app_path = sys.executable
+    def _on_file_started(self, path_str: str):
+        # Highlight current row
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            widget = self.file_list_widget.itemWidget(item)
+            if str(widget.file_path.resolve()) == path_str:
+                widget.setStyleSheet("background-color: #e0f0ff;")
             else:
-                # Running as script
-                app_path = os.path.abspath(sys.argv[0])
+                widget.setStyleSheet("")
+        self.current_file_label.setText(f"Hashing: {Path(path_str).name}")
 
-            # Re-run with the new file
-            subprocess.Popen([app_path, file_path], start_new_session=True)
+    def _on_progress(self, current: int, total: int):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+
+    def _on_file_result(self, path_str: str, md5: str, sha256: str):
+        row = self.file_rows.get(path_str)
+        if row:
+            row.set_hashes(md5, sha256)
+            # Also log to live log if visible
+            if self.live_log_toggle.isChecked():
+                self.log_text.append(f"✅ {Path(path_str).name} - MD5: {md5} SHA256: {sha256}")
+                self.log_text.moveCursor(QTextCursor.End)
+        # Remove highlight
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            widget = self.file_list_widget.itemWidget(item)
+            if str(widget.file_path.resolve()) == path_str:
+                widget.setStyleSheet("")
+                break
+
+    def _on_file_error(self, path_str: str, error_msg: str):
+        row = self.file_rows.get(path_str)
+        if row:
+            row.set_hashes("ERROR", "ERROR")
+        if self.live_log_toggle.isChecked():
+            self.log_text.append(f"❌ {Path(path_str).name}: {error_msg}")
+            self.log_text.moveCursor(QTextCursor.End)
+
+    def _on_finished(self, total: int, error_count: int):
+        self._reset_ui()
+        # Write output file
+        self._write_output_file(total, error_count)
+        msg = f"Hashing completed. Processed {total} files, errors: {error_count}. Results saved to {self.output_path}"
+        self.statusBar().showMessage(msg)
+        QMessageBox.information(self, "Complete", msg)
+
+    def _on_cancelled(self):
+        self._reset_ui()
+        self.statusBar().showMessage("Cancelled by user")
+        if self.live_log_toggle.isChecked():
+            self.log_text.append("⚠️ Operation cancelled")
+
+    def _reset_ui(self):
+        self.cancel_btn.setEnabled(False)
+        self.start_btn.setEnabled(True)
+        self.clear_all_btn.setEnabled(True)
+        self.browse_out_btn.setEnabled(True)
+        self.md5_cb.setEnabled(True)
+        self.sha256_cb.setEnabled(True)
+        self.file_list_widget.setAcceptDrops(True)
+        self.current_file_label.setText("Ready")
+        self.progress_bar.setValue(0)
+        # Remove any row highlights
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            widget = self.file_list_widget.itemWidget(item)
+            widget.setStyleSheet("")
+
+    def _write_output_file(self, total: int, error_count: int):
+        if not self.output_path:
+            return
+        try:
+            with open(self.output_path, 'w', encoding='utf-8') as f:
+                for idx, file_path in enumerate(self.file_paths, start=1):
+                    row = self.file_rows.get(str(file_path.resolve()))
+                    md5_val = row.md5 if row and row.hashes_ready else "NOT COMPUTED"
+                    sha256_val = row.sha256 if row and row.hashes_ready else "NOT COMPUTED"
+                    f.write(f"FILE #{idx}\n")
+                    f.write(f"FILENAME: {file_path.name}\n")
+                    f.write(f"MD5: {md5_val}\n")
+                    f.write(f"SHA256: {sha256_val}\n\n")
+                f.write(f"Total files processed: {total}\n")
+                if error_count > 0:
+                    f.write(f"Errors: {error_count}\n")
         except Exception as e:
-            QMessageBox.critical(
-                self.main_window,
-                "Ошибка запуска",
-                f"Не удалось запустить новое окно:\n{e}"
-            )
+            QMessageBox.warning(self, "Write Error", f"Failed to write output file:\n{e}")
 
-    def save_file(self) -> bool:
-        # Prefer viewer-provided save if any
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv:
-            return False
 
-        # Some viewers expose merge/flatten step prior to save
-        try:
-            if hasattr(pv, 'merge_annotations_to_document'):
-                pv.merge_annotations_to_document()
-        except Exception:
-            pass
+def main():
+    app = QApplication(sys.argv)
+    # Try to load a nicer font for icons (optional)
+    # You could load Font Awesome if available, but we use emojis.
+    window = HashKitWindow()
+    window.show()
+    sys.exit(app.exec())
 
-        # Old API
-        if hasattr(pv, 'save_changes'):
-            success = bool(pv.save_changes())
-            if success:
-                self._mark_not_modified()
-            return success
 
-        # Newer API requires a target path
-        current_path = getattr(self.main_window, 'current_document_path', '')
-        if not current_path:
-            return self.save_file_as()
-
-        if hasattr(pv, 'save_document'):
-            try:
-                ok = bool(pv.save_document(current_path))
-            except TypeError:
-                # some implementations accept (path=None)
-                ok = bool(pv.save_document())
-            if ok:
-                self._mark_not_modified()
-                return True
-
-        QMessageBox.critical(self.main_window, "Save Error", "Failed to save the document.")
-        return False
-
-    def save_file_as(self) -> bool:
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv:
-            return False
-
-        last_dir = settings_manager.get_last_directory()
-        base = os.path.splitext(os.path.basename(getattr(self.main_window, 'current_document_path', '') or 'document'))[
-            0]
-        default_name = f"{base}_modified.pdf" if base else "document.pdf"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self.main_window,
-            "Save PDF As",
-            os.path.join(last_dir, default_name),
-            "PDF Files (*.pdf)"
-        )
-        if not file_path:
-            return False
-
-        settings_manager.save_last_directory(os.path.dirname(file_path))
-
-        try:
-            if hasattr(pv, 'merge_annotations_to_document'):
-                pv.merge_annotations_to_document()
-        except Exception:
-            pass
-
-        ok = False
-        if hasattr(pv, 'save_changes'):
-            ok = bool(pv.save_changes(file_path))
-        elif hasattr(pv, 'save_document'):
-            ok = bool(pv.save_document(file_path))
-
-        if ok:
-            self.main_window.current_document_path = file_path
-            if hasattr(self.main_window, 'setWindowTitle'):
-                filename = os.path.basename(file_path)
-                self.main_window.setWindowTitle(f"PDF Editor - {filename}")
-            self._mark_not_modified()
-            settings_manager.add_recent_file(file_path)
-            self.update_recent_files_menu()
-            return True
-
-        QMessageBox.critical(self.main_window, "Ошибка при сохранении", "Не удалось сохранить документ.")
-        return False
-
-    def close_file(self):
-        if getattr(self.main_window, 'is_document_modified', False):
-            reply = self.main_window.ask_save_changes()
-            if reply == QMessageBox.Cancel:
-                return
-            if reply == QMessageBox.Save and not self.save_file():
-                return
-
-        pv = getattr(self.ui, 'pdfView', None)
-        if hasattr(pv, 'close_document'):
-            pv.close_document()
-
-        # Clear thumbnails for both old and new widgets
-        thumb = getattr(self.ui, 'thumbnailList', None)
-        if thumb:
-            for method in ('clear_thumbnails', 'clear', 'refresh_thumbnails'):
-                if hasattr(thumb, method):
-                    try:
-                        getattr(thumb, method)()
-                        break
-                    except Exception:
-                        pass
-
-        m_document = getattr(self.ui, 'm_document', None)
-        if m_document:
-            m_document.close()
-
-        self.main_window.current_document_path = ""
-        self._mark_not_modified(update_title=True)
-        if hasattr(self.main_window, 'update_page_info'):
-            self.main_window.update_page_info()
-
-    def _mark_not_modified(self, update_title: bool = False):
-        self.main_window.is_document_modified = False
-        if hasattr(self.main_window, 'update_ui_state'):
-            self.main_window.update_ui_state()
-        if update_title and hasattr(self.main_window, 'setWindowTitle'):
-            self.main_window.setWindowTitle("PDF Editor")
-        if hasattr(self.main_window, 'update_window_title'):
-            self.main_window.update_window_title()
-
-    # -----------------------------
-    # Printing (prints only visible pages, preserving layout order). If the
-    # viewer implements its own print_document(), we prefer that.
-    # -----------------------------
-    def print_document(self):
-        # Проверка всех компонент
-
-        pv = getattr(self.ui, 'pdfView', None)
-        if hasattr(pv, 'print_document'):
-            try:
-                pv.print_document()
-                return
-            except Exception:
-                pass
-
-        if not pv or not hasattr(pv, 'document') or pv.document is None:
-            messagebox_info(self.main_window, "Warning", "Please open a PDF file first.")
-            return
-
-        if fitz is None:
-            QMessageBox.critical(
-                self.main_window,
-                "Ошибка печати",
-                "PyMuPDF (fitz) не установлен — операция недоступна."
-            )
-            return
-
-        PDFPrinter.print_pdf_with_settings(self.main_window, pv.document.current_doc)
-        return
-
-    # -----------------------------
-    # Navigation (respect layout order when available)
-    # -----------------------------
-    def previous_page(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv:
-            return
-
-        if hasattr(pv, 'previous_page'):
-            pv.previous_page()
-            return
-
-        if hasattr(pv, 'get_current_page') and hasattr(pv, 'layout_index_for_original'):
-            current_original = pv.get_current_page()
-            current_layout = pv.layout_index_for_original(current_original)
-            vis = self.get_visible_pages_in_layout_order()
-            if current_layout in vis:
-                i = vis.index(current_layout)
-                if i > 0:
-                    pv.go_to_page(vis[i - 1])
-
-    def next_page(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv:
-            return
-
-        if hasattr(pv, 'next_page'):
-            pv.next_page()
-            return
-
-        if hasattr(pv, 'get_current_page') and hasattr(pv, 'layout_index_for_original'):
-            current_original = pv.get_current_page()
-            current_layout = pv.layout_index_for_original(current_original)
-            vis = self.get_visible_pages_in_layout_order()
-            if current_layout in vis:
-                i = vis.index(current_layout)
-                if i < len(vis) - 1:
-                    pv.go_to_page(vis[i + 1])
-
-    def jump_to_first_page(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        if hasattr(pv, 'go_to_page'):
-            vis = self.get_visible_pages_in_layout_order()
-            if vis:
-                pv.go_to_page(vis[0])
-
-    def jump_to_last_page(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        if hasattr(pv, 'go_to_page'):
-            vis = self.get_visible_pages_in_layout_order()
-            if vis:
-                pv.go_to_page(vis[-1])
-
-    # -----------------------------
-    # View ops
-    # -----------------------------
-    # def _update_zoom_selector(self, zoom_value: Optional[float] = None):
-    #     selector = getattr(self.ui, 'm_zoomSelector', None)
-    #     pv = getattr(self.ui, 'pdfView', None)
-    #     if selector and hasattr(selector, 'set_zoom_value'):
-    #         if zoom_value is None:
-    #             for attr in ('zoom_factor', 'zoom_level'):
-    #                 if hasattr(pv, attr):
-    #                     zoom_value = getattr(pv, attr)
-    #                     break
-    #         if zoom_value is not None:
-    #             selector.set_zoom_value(float(zoom_value))
-
-    def zoom_in(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        pv.zoom_type = 0
-        if hasattr(pv, 'zoom_in'):
-            pv.zoom_in()
-        elif hasattr(pv, 'set_zoom'):
-            current = getattr(pv, 'zoom_level', 1.0)
-            pv.set_zoom(min(5.0, current * 1.25))
-        # self._update_zoom_selector()
-
-    def zoom_out(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        pv.zoom_type = 0
-        if hasattr(pv, 'zoom_out'):
-            pv.zoom_out()
-        elif hasattr(pv, 'set_zoom'):
-            current = getattr(pv, 'zoom_level', 1.0)
-            pv.set_zoom(max(0.25, current * 0.8))
-        # self._update_zoom_selector()
-
-    def fit_to_width(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        # self.ui.actionFitToHeight.setChecked(False)
-        # pv.toggle_fit_to_width(self.ui.actionFitToWidth.isChecked())
-        pv.toggle_fit_to_width()
-
-    def fit_to_height(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        # self.ui.actionFitToWidth.setChecked(False)
-        # pv.toggle_fit_to_height(self.ui.actionFitToHeight.isChecked())
-        pv.toggle_fit_to_height()
-
-    def rotate_view_clockwise(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        if hasattr(pv, 'rotate_view'):
-            pv.rotate_view(90)
-
-    def rotate_view_counterclockwise(self):
-        pv = getattr(self.ui, 'pdfView', None)
-        if hasattr(pv, 'rotate_view'):
-            pv.rotate_view(-90)
-
-    # -----------------------------
-    # Panel ops (respecting new splitter sizing)
-    # -----------------------------
-    def toggle_side_panel(self):
-        if not hasattr(self.ui, 'sidePanelContent'):
-            return
-        is_visible = self.ui.sidePanelContent.isVisible()
-
-        if not is_visible:
-            self.ui.sidePanelContent.show()
-            # Prefer opening the Pages tab
-            for name in ('pagesButton', 'pagesTab'):
-                w = getattr(self.ui, name, None)
-                if hasattr(w, 'setChecked'):
-                    w.setChecked(True)
-                if hasattr(w, 'show'):
-                    w.show()
-
-            if hasattr(self.ui, 'splitter'):
-                sizes = self.ui.splitter.sizes()
-                total = sum(sizes) if sizes else self.main_window.width()
-                tab_buttons_width = 25
-                # try to restore preferred width from settings if present
-                try:
-                    _, panel_width, _ = settings_manager.load_panel_state()
-                except Exception:
-                    panel_width = 150
-                panel_width = max(150, min(300, int(panel_width or 150)))
-                self.ui.splitter.setSizes(
-                    [tab_buttons_width, panel_width, max(400, total - tab_buttons_width - panel_width)])
-        else:
-            self.ui.sidePanelContent.hide()
-            if hasattr(self.ui, 'splitter'):
-                total = sum(self.ui.splitter.sizes())
-                self.ui.splitter.setSizes([25, 0, max(0, total - 25)])
-
-    # -----------------------------
-    # page edits
-    # -----------------------------
-
-    def delete_pages(self, current_page: bool = True):
-        """Delete pages: either the current page only, or a user-specified range."""
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv or (hasattr(pv, 'document') and pv.document is None):
-            QMessageBox.warning(self.main_window, "Нет документа", "Сначала откройте PDF документ.")
-            return
-
-        cur_doc = pv.document.current_doc
-        total_pages = cur_doc.page_count
-        if total_pages <= 0:
-            QMessageBox.warning(self.main_window, "Ошибка", "Не удалось определить количество страниц.")
-            return
-
-        if current_page:
-            # Delete only the current page
-            try:
-                current_index = getattr(pv, 'get_current_page', lambda: 0)()
-                pages_to_delete = [current_index]
-                print(f"pages_to_delete: {pages_to_delete}")
-                success = pv.delete_pages_by_range(pages_to_delete)
-                if not success:
-                    raise RuntimeError("Ошибка при удалении страницы.")
-            except Exception as e:
-                QMessageBox.critical(
-                    self.main_window,
-                    "Ошибка удаления", f"Не удалось удалить текущую страницу:\n{e}")
-                return
-        else:
-            # ask user for page ranges
-            dialog = PagesRangeDialog(self.main_window, "DELETE")
-            if dialog.exec() != QDialog.Accepted:
-                return
-
-            try:
-                pages_to_delete = dialog.get_page_ranges()
-            except ValueError as e:
-                QMessageBox.critical(self.main_window, "Ошибка ввода", f"Некорректные данные: {e}")
-                return
-
-            try:
-                # pdf_viewer.delete_pages_by_range() expects list of 0-based indices
-                success = pv.delete_pages_by_range(pages_to_delete)
-                if not success:
-                    raise RuntimeError("Ошибка при удалении страниц.")
-            except Exception as e:
-                QMessageBox.critical(self.main_window, "Ошибка удаления", f"Не удалось удалить страницы:\n{e}")
-                return
-
-        # refresh UI
-        self.ui.thumbnailList.refresh_thumbnails(pv.document)
-        return
-
-    def export_pages(self):
-        """Export a range of pages as a single PDF or as separate image/PDF files."""
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv or not hasattr(pv, 'document') or pv.document is None:
-            QMessageBox.warning(self.main_window, "Нет документа", "Пожалуйста, сначала откройте PDF файл.")
-            return
-
-        cur_doc = pv.document.current_doc
-        total_pages = cur_doc.page_count
-        if total_pages <= 0:
-            QMessageBox.warning(self.main_window, "Ошибка", "Не удалось определить количество страниц.")
-            return
-
-        current_page = getattr(pv, 'get_current_page', lambda: 0)()
-
-        dialog = ExportPagesDialog(
-            self.main_window,
-            total_pages=total_pages,
-            current_page=current_page + 1,
-        )
-        if dialog.exec() != QDialog.Accepted:
-            return
-
-        try:
-            pages_to_export = dialog.get_page_range()
-        except ValueError as e:
-            QMessageBox.warning(self.main_window, "Ошибка ввода", str(e))
-            return
-
-        if not pages_to_export:
-            return
-
-        separate = dialog.is_separate_files()
-        fmt = dialog.get_format()          # 'PDF', 'PNG', 'JPEG', 'BMP'
-        delete_after = dialog.is_delete_after_export()
-
-        last_dir = settings_manager.get_last_directory()
-        doc_basename = os.path.splitext(
-            os.path.basename(getattr(self.main_window, 'current_document_path', '') or 'document')
-        )[0]
-
-        # ── Ask for output folder ────────────────────────────────────────
-        output_dir = QFileDialog.getExistingDirectory(
-            self.main_window,
-            "Выберите папку для сохранения",
-            last_dir,
-        )
-        if not output_dir:
-            return
-        settings_manager.save_last_directory(output_dir)
-
-        # ── Export ──────────────────────────────────────────────────────
-        if not separate:
-            # Single merged PDF
-            default_name = f"{doc_basename}_export.pdf"
-            save_path = os.path.join(output_dir, default_name)
-            try:
-                new_doc = fitz.open()
-                for page_num in pages_to_export:
-                    new_doc.insert_pdf(cur_doc, from_page=page_num, to_page=page_num)
-                new_doc.save(save_path)
-                new_doc.close()
-                if delete_after:
-                    pv.delete_pages_by_range(pages_to_export)
-                    self.ui.thumbnailList.refresh_thumbnails(pv.document)
-                QMessageBox.information(
-                    self.main_window,
-                    "Успешно",
-                    f"Экспортировано {len(pages_to_export)} стр. в файл:\n{os.path.basename(save_path)}"
-                )
-            except Exception as e:
-                QMessageBox.critical(self.main_window, "Ошибка", f"Не удалось сохранить PDF:\n{e}")
-            return
-
-        # ── Separate files ───────────────────────────────────────────────
-        zoom = 4.0          # 300 DPI (72 pt/in × 4 ≈ 288 ≈ 300 DPI)
-        fmt_ext = fmt.lower().replace('jpeg', 'jpg')
-        qt_fmt  = fmt        # QImage.save() format string
-
-        progress = QProgressDialog(
-            f"Экспорт {len(pages_to_export)} страниц...", "Отмена",
-            0, len(pages_to_export), self.main_window
-        )
-        progress.setWindowModality(Qt.WindowModal)
-        progress.show()
-
-        successful, failed = 0, []
-        try:
-            for idx, page_num in enumerate(pages_to_export):
-                progress.setValue(idx)
-                QApplication.processEvents()
-                if progress.wasCanceled():
-                    break
-
-                try:
-                    if fmt == "PDF":
-                        filename = f"{doc_basename}_стр_{page_num + 1}.pdf"
-                        out_path = os.path.join(output_dir, filename)
-                        single = fitz.open()
-                        single.insert_pdf(cur_doc, from_page=page_num, to_page=page_num)
-                        single.save(out_path)
-                        single.close()
-                    else:
-                        page = pv.document.get_page(page_num)
-                        rotation = pv.page_rotations.get(page_num, 0)
-                        if rotation:
-                            page.set_rotation(rotation)
-                        matrix = fitz.Matrix(zoom, zoom)
-                        pix = page.get_pixmap(matrix=matrix, alpha=False, colorspace=fitz.csRGB)
-                        img_data = pix.tobytes("ppm")
-                        image = QImage()
-                        image.loadFromData(img_data)
-                        if image.isNull():
-                            raise RuntimeError("Не удалось получить изображение страницы.")
-                        filename = f"{doc_basename}_стр_{page_num + 1}.{fmt_ext}"
-                        out_path = os.path.join(output_dir, filename)
-                        quality = 95 if fmt == "JPEG" else -1
-                        if not image.save(out_path, qt_fmt, quality):
-                            raise RuntimeError("QImage.save() вернул False.")
-                    successful += 1
-                except Exception as e:
-                    failed.append(page_num + 1)
-                    print(f"Export error page {page_num + 1}: {e}")
-
-        finally:
-            progress.close()
-
-        if failed:
-            QMessageBox.warning(
-                self.main_window,
-                "Экспорт завершён с ошибками",
-                f"Успешно: {successful}\nОшибки на страницах: {', '.join(map(str, failed))}"
-            )
-        else:
-            if delete_after:
-                pv.delete_pages_by_range(pages_to_export)
-                self.ui.thumbnailList.refresh_thumbnails(pv.document)
-            QMessageBox.information(
-                self.main_window,
-                "Успешно",
-                f"Все {successful} файл(ов) сохранены в:\n{output_dir}"
-            )
-
-    def show_pdf_info(self):
-        """Показать детальную техническую информацию о текущем PDF документе"""
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv or not hasattr(pv, 'document') or pv.document is None:
-            QMessageBox.information(self.main_window, "Информация о PDF",
-                                    "В настоящее время PDF документ не открыт.")
-            return
-
-        try:
-            doc = pv.document
-            doc_path = getattr(pv, 'doc_path', 'Неизвестно')
-
-            # Сбор комплексной информации о PDF
-            info = doc.current_doc.metadata
-            page_count = doc.get_page_count()  #len(doc)
-
-            # Информация о файле
-            file_size = "Неизвестно"
-            file_date = "Неизвестно"
-            if os.path.exists(doc_path):
-                size_bytes = os.path.getsize(doc_path)
-                file_size = self._format_file_size(size_bytes)
-                file_date = datetime.fromtimestamp(os.path.getmtime(doc_path)).strftime('%Y-%m-%d %H:%M:%S')
-
-            # Технические свойства документа
-            is_encrypted = doc.current_doc.is_encrypted
-            needs_pass = doc.current_doc.needs_pass
-            can_save = not getattr(doc.current_doc, 'can_save_incrementally', lambda: True)()
-            is_repaired = getattr(doc.current_doc, 'is_repaired', False)
-            is_pdf = getattr(doc.current_doc, 'is_pdf', True)
-
-            # Check if document has bookmarks
-            has_bookmarks = "Нет"
-            try:
-                # Try to get bookmarks using PyMuPDF
-                toc = doc.current_doc.get_toc()
-                has_bookmarks = "Да" if toc else "Нет"
-
-                # If there are bookmarks, show how many
-                if toc:
-                    bookmark_count = len(toc)
-                    has_bookmarks = f"Да: {bookmark_count}"
-            except Exception:
-                # If we can't check bookmarks, show unknown
-                has_bookmarks = "Неизвестно"
-
-            # Получить информацию о шифровании, если доступно
-            encryption_info = ""
-            if is_encrypted:
-                try:
-                    encrypt_method = getattr(doc.current_doc, 'get_encryption_method', lambda: 'Неизвестно')()
-                    encrypt_bits = getattr(doc.current_doc, 'get_encryption_strength', lambda: 0)()
-                    encryption_info = f"{encrypt_method} ({encrypt_bits} бит)"
-                except:
-                    encryption_info = "Зашифрован"
-
-            # Информация о страницах
-            visible_pages = pv.get_visible_page_count() if hasattr(pv, 'get_visible_page_count') else page_count
-            deleted_pages = len(getattr(pv, 'deleted_pages', set()))
-            rotated_pages = len(getattr(pv, 'page_rotations', {}))
-
-            # Получить размеры текущей страницы для справки
-            page_dimensions = ""
-            if page_count > 0:
-                try:
-                    current_page = doc.current_doc[pv.get_current_page()]
-                    rect = current_page.rect
-                    page_dimensions = f"{rect.width:.1f} x {rect.height:.1f} пунктов"
-                except:
-                    page_dimensions = "Неизвестно"
-
-            # Построение комплексного информационного сообщения
-            message = f"""
-    <b>Информация о PDF документе</b>
-    <br><br>
-
-    <b>Информация о файле:</b><br>
-    • <b>Имя:</b> {os.path.basename(doc_path)}<br>
-    • <b>Путь:</b> {doc_path}<br>
-    • <b>Размер:</b> {file_size}<br>
-    • <b>Изменен:</b> {file_date}<br>
-    <br>
-
-    <b>Структура документа:</b><br>
-    • <b>Всего страниц:</b> {page_count}<br>
-    • <b>Видимые страницы:</b> {visible_pages}<br>
-    • <b>Удаленные страницы:</b> {deleted_pages}<br>
-    • <b>Повернутые страницы:</b> {rotated_pages}<br>
-    • <b>Размер страницы (первая):</b> {page_dimensions}<br>
-    <br>
-
-    <b>Технические свойства:</b><br>
-    • <b>Версия PDF:</b> {getattr(doc.current_doc, 'pdf_version', 'Неизвестно')}<br>
-    • <b>Закладки:</b> {has_bookmarks}<br>
-    <br>
-
-    <b>Метаданные:</b><br>
-    • <b>Заголовок:</b> {info.get('title', 'Не указан')}<br>
-    • <b>Автор:</b> {info.get('author', 'Не указан')}<br>
-    • <b>Тема:</b> {info.get('subject', 'Не указан')}<br>
-    • <b>Ключевые слова:</b> {info.get('keywords', 'Не указаны')}<br>
-    • <b>Создатель:</b> {info.get('creator', 'Не указан')}<br>
-    • <b>Производитель:</b> {info.get('producer', 'Не указан')}<br>
-    • <b>Дата создания:</b> {self._parse_pdf_date(info.get('creationDate', 'Не указана'))}<br>
-    • <b>Дата изменения:</b> {self._parse_pdf_date(info.get('modDate', 'Не указана'))}<br>
-    <br>
-
-    <b>Состояние просмотрщика:</b><br>
-    • <b>Текущий масштаб:</b> {getattr(pv, 'zoom_level', 1.0):.1%}<br>
-    • <b>Текущая страница:</b> {pv.get_current_page() + 1 if hasattr(pv, 'get_current_page') else 'Неизвестно'}<br>
-    • <b>Документ изменен:</b> {'Да' if getattr(pv, 'is_modified', False) else 'Нет'}<br>
-    • <b>Аннотации:</b> {len(getattr(pv, 'page_annotations', {}))} страниц с аннотациями<br>
-    """
-
-            # Создать и показать окно сообщения
-            msg_box = QMessageBox(self.main_window)
-            msg_box.setWindowTitle(f"Информация о PDF - {os.path.basename(doc_path)}")
-            msg_box.setTextFormat(Qt.RichText)
-            msg_box.setText(message)
-
-            # Сделать диалог больше, чтобы показать всю информацию
-            msg_box.resize(600, 700)
-
-            msg_box.setStandardButtons(QMessageBox.Ok)
-            msg_box.exec()
-
-        except Exception as e:
-            QMessageBox.critical(self.main_window, "Ошибка",
-                                 f"Не удалось получить информацию о PDF:\n{str(e)}")
-
-    def _format_file_size(self, size_bytes):
-        """Format file size in human-readable format"""
-        if size_bytes == 0:
-            return "0 bytes"
-
-        size_names = ["bytes", "KB", "MB", "GB"]
-        i = 0
-        while size_bytes >= 1024 and i < len(size_names) - 1:
-            size_bytes /= 1024.0
-            i += 1
-
-        return f"{size_bytes:.1f} {size_names[i]}"
-
-    def _parse_pdf_date(self, pdf_date_str):
-        """Parse PDF date string and convert to human-readable format with time"""
-        if not pdf_date_str or pdf_date_str == 'Не указана':
-            return 'Не указана'
-
-        try:
-            # PDF dates are in format: D:YYYYMMDDHHmmSSOHH'mm'
-            # Example: D:20231225143000+03'00'
-
-            if pdf_date_str.startswith('D:'):
-                date_str = pdf_date_str[2:]
-            else:
-                date_str = pdf_date_str
-
-            # Extract date and time components
-            year = int(date_str[0:4]) if len(date_str) >= 4 else 2023
-            month = int(date_str[4:6]) if len(date_str) >= 6 else 1
-            day = int(date_str[6:8]) if len(date_str) >= 8 else 1
-
-            # Extract time components if available
-            hour = int(date_str[8:10]) if len(date_str) >= 10 else 0
-            minute = int(date_str[10:12]) if len(date_str) >= 12 else 0
-            second = int(date_str[12:14]) if len(date_str) >= 14 else 0
-
-            # from datetime import datetime
-            # date_obj = datetime(year, month, day, hour, minute, second)
-
-            months_ru = {
-                1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля',
-                5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа',
-                9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
-            }
-
-            if hour == 0 and minute == 0 and second == 0:
-                # Only date, no time
-                return f"{day} {months_ru.get(month, 'января')} {year} года"
-            else:
-                # Date with time
-                return f"{day} {months_ru.get(month, 'января')} {year} года, {hour:02d}:{minute:02d}"
-
-        except Exception as e:
-            print(f"Error parsing PDF date '{pdf_date_str}': {e}")
-            return pdf_date_str
-
-    def show_about(self):
-        """Показать информацию о приложении"""
-        APP_NAME = "Редактор PDF Альт"
-        APP_VERSION = "0.831"
-        APP_DESCRIPTION = "Приложение для просмотра и редактирования PDF-файлов для операционной системы Альт Рабочая станция."
-
-        about_text = f"""
-        <b>{APP_NAME}</b><br>
-        <b>Версия:</b> {APP_VERSION}<br><br>
-        {APP_DESCRIPTION}<br><br>
-    
-        <b>Разработано с использованием:</b><br>
-        • <b>PySide6</b> — кроссплатформенный GUI фреймворк (обёртка Qt {self._get_qt_version()} для Python)<br>
-        • <b>PyMuPDF (Fitz)</b> — библиотека для высокопроизводительной работы с PDF-документами<br>
-        • <b>Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}</b> — язык программирования<br>
-        • Стандартные библиотеки Python<br><br>
-    
-        <b>Редактор PDF Альт разработан </b>ОППО ГИСиСАПР<br>
-        ПУ «СургутАСУнефть», ПАО «Сургутнефтегаз».<br><br>
-    
-        При возникновении проблем обращаться в<br>
-        <b>Naumen Service Desk</b>:<br>
-        – ИТ-решение: <u>0085</u><br>
-        – ИС: <u>1873</u>
-        """
-
-        msg_box = QDialog(self.main_window)
-        msg_box.setWindowTitle(f"О программе")
-        msg_box.setModal(True)
-        msg_box.setMinimumSize(570, 360)
-        msg_box.resize(570, 360)
-        layout = QVBoxLayout()
-
-        label = QLabel(about_text)
-        label.setTextFormat(Qt.RichText)
-        label.setWordWrap(True)
-        label.setOpenExternalLinks(True)
-        label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        # label.setStyleSheet("padding: 10px; font-size: 11pt;")
-
-        layout.addWidget(label)
-
-        ok_button = QPushButton("OK")
-        ok_button.clicked.connect(msg_box.accept)
-        ok_button.setDefault(True)
-        layout.addWidget(ok_button, alignment=Qt.AlignRight)
-
-        msg_box.setLayout(layout)
-        msg_box.exec()
-
-        # msg_box = QDialog(self.main_window)
-        # msg_box.setWindowTitle(f"О программе {APP_NAME}")
-        # msg_box.setTextFormat(Qt.RichText)
-        # msg_box.setText(about_text)
-        # msg_box.setIcon(QMessageBox.Information)
-        # msg_box.setStandardButtons(QMessageBox.Ok)
-        # msg_box.exec()
-
-    def _get_qt_version(self):
-        """Получить строку версии Qt"""
-        try:
-            from PySide6.QtCore import qVersion
-            return qVersion()
-        except:
-            return "Неизвестно"
-
-    def enumerate_pages(self):
-        """Add page numbers to all pages"""
-        pv = getattr(self.ui, 'pdfView', None)
-        if not pv or not hasattr(pv, 'document') or pv.document is None:
-            QMessageBox.warning(
-                self.main_window,
-                "Нет документа",
-                "Пожалуйста, сначала откройте PDF-файл."
-            )
-            return
-
-        # Position dialog
-        position_map = {
-            "По центру снизу": "center",
-            "Внизу слева": "left",
-            "Внизу справа": "right"
-        }
-
-        position_display, ok = QInputDialog.getItem(
-            self.main_window,
-            "Выбрать расположение",
-            "Выберите расположение для номеров страниц:",
-            list(position_map.keys()),
-            0,
-            False
-        )
-        if not ok:
-            return
-
-        position = position_map[position_display]
-
-        # Font size dialog
-        font_size, ok = QInputDialog.getInt(
-            self.main_window,
-            "Размер шрифта",
-            "Введите размер шрифта:",
-            12, 8, 24
-        )
-        if not ok:
-            return
-
-        try:
-            # Add page numbers (doesn't save immediately)
-            if hasattr(pv, 'add_page_numbers'):
-                success = pv.add_page_numbers(position, font_size)
-
-                if success:
-                    # Mark as modified
-                    if hasattr(self.main_window, 'on_document_modified'):
-                        self.main_window.on_document_modified(True)
-                    else:
-                        self.main_window.is_document_modified = True
-
-                    if hasattr(self.main_window, 'update_ui_state'):
-                        self.main_window.update_ui_state()
-                    if hasattr(self.main_window, 'update_window_title'):
-                        self.main_window.update_window_title()
-
-                    QMessageBox.information(
-                        self.main_window,
-                        "Успех",
-                        "Нумерация страниц добавлена.\nИспользуйте 'Сохранить' или 'Сохранить как' для применения изменений."
-                    )
-                else:
-                    QMessageBox.critical(
-                        self.main_window,
-                        "Ошибка",
-                        "Не удалось добавить номера страниц."
-                    )
-            else:
-                QMessageBox.critical(
-                    self.main_window,
-                    "Ошибка",
-                    "Функция нумерации страниц недоступна."
-                )
-
-        except Exception as e:
-            QMessageBox.critical(
-                self.main_window,
-                "Ошибка",
-                f"Не удалось добавить номера страниц: {str(e)}"
-            )
-
-    def get_ghostscript_path(self):
-        """Get Ghostscript executable path for compressing pdf-files"""
-
-        # possible_paths = [os.path.join(base_dir, "ghostscript", "gswin64c.exe"),
-        #                   os.path.join(base_dir, "gswin64c.exe"),
-        #                   os.path.join(".", "ghostscript", "gswin64c.exe")]
-        #
-        # for path in possible_paths:
-        #     if os.path.isfile(path):
-        #         return path
-
-        if sys.platform.startswith("win32"):  # Windows
-            if getattr(sys, 'frozen', False):
-                gs_path = sys._MEIPASS  # base --onedir path
-                base_dir = os.path.join(gs_path, "ghostscript")
-            else:
-                # for windows r"C:\Program Files\gs\gs10.04.0\bin\gswin64c.exe"
-                base_dir = r"C:/Scopogstall/DevEnv/repos/py/altpdf/gs/lib"  # os.path.dirname(os.path.abspath(__file__))
-            gs_exe_name = "gswin64c.exe"
-
-        else:  # Linux
-            if getattr(sys, 'frozen', False):
-                gs_path = sys._MEIPASS  # base --onedir path
-                base_dir = os.path.join(gs_path, "ghostscript")
-            else:
-                base_dir = "/usr/bin"  # /home/SGC.OIL.GAS/fatkhutdinov_vd/py_projects_2025/gs_folder/gs
-            gs_exe_name = "gs"
-
-        gs_path = os.path.join(base_dir, gs_exe_name)
-
-        # QMessageBox.warning(self.main_window, "Linux debug",
-        #                     f"Looking for GS in {gs_path}.")
-
-        return gs_path if os.path.isfile(gs_path) else None
-
-    def compress_pdf(self):
-        gs_path = self.get_ghostscript_path()  # r"C:\Program Files\gs\gs10.04.0\bin\gswin64c.exe"
-
-        if not gs_path:
-            QMessageBox.warning(self.main_window, "Ошибка сжатия",
-                                "Не найдена библиотека для сжатия файлов.")
-            return
-
-        current_path = getattr(self.main_window, 'current_document_path', '')
-        if not current_path:
-            QMessageBox.warning(self.main_window, "Нет документа", "Пожалуйста, сначала откройте PDF файл.")
-            return
-
-        # Обработка несохраненных изменений
-        if getattr(self.main_window, 'is_document_modified', False):
-            clicked_button = self.save_message_box(
-                "",
-                "В документе есть несохраненные изменения. Требуется сохранить их перед сжатием."
-            )
-            if clicked_button == QMessageBox.RejectRole:
-                return
-            elif clicked_button == QMessageBox.YesRole:
-                if not self.save_file():
-                    return
-
-        # Предлагаем выбрать место для сохранения сжатого файла
-        default_dir = os.path.dirname(current_path)
-        default_name = os.path.splitext(os.path.basename(current_path))[0] + "_compressed.pdf"
-        default_path = os.path.join(default_dir, default_name)
-
-        output_path, _ = QFileDialog.getSaveFileName(
-            self.main_window,
-            "Сохранить сжатый PDF файл как...",
-            default_path,
-            "PDF Files (*.pdf);;All Files (*)"
-        )
-
-        if not output_path:
-            return
-
-        # Вдруг пользователь забудет .pdf прописать в конце
-        if not output_path.lower().endswith('.pdf'):
-            output_path += '.pdf'
-
-        # Вдруг пользователь захочет перезаписать оригинальный файл
-        if os.path.abspath(output_path) == os.path.abspath(current_path):
-            reply = QMessageBox.question(
-                self.main_window,
-                "Перезапись файла",
-                "Вы пытаетесь сохранить сжатый файл поверх исходного.\n"
-                "Это приведёт к потере исходного файла"
-                "Вы уверены?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                return self.compress_pdf()  # Заново вызываем функцию просто
-
-        quality_options = {
-            "Максимальное сжатие": "/prepress",
-            "Высокое": "/printer",
-            "Среднее": "/ebook",
-            "Наименьшее сжатие": "/screen"
-        }
-
-        quality, ok = QInputDialog.getItem(
-            self.main_window,
-            "Качество сжатия:",
-            "Выберите уровень сжатия:",
-            list(quality_options.keys()),
-            2,  #  По-умолчанию ebook - "Среднее"
-            False
-        )
-
-        if not ok:
-            return
-
-        quality_value = quality_options[quality]
-
-        # Подбираем параметры и сжимаем
-        input_path = current_path
-
-        env = os.environ.copy()
-        if sys.platform.startswith("linux"):
-            if 'LD_LIBRARY_PATH_ORIG' in env:
-                env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
-            else:
-                env.pop('LD_LIBRARY_PATH', None)
-
-        if not os.path.isfile(input_path):
-            raise FileNotFoundError(f"Файл {input_path} не найден")
-
-        gs_command = [
-            gs_path,
-            "-sDEVICE=pdfwrite",
-            "-dCompatibilityLevel=1.4",
-            f"-dPDFSETTINGS={quality_value}",
-            "-dNOPAUSE",
-            "-dQUIET",
-            "-dBATCH",
-            f"-sOutputFile={output_path}",
-            input_path
-        ]
-
-        print(gs_command)
-
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-        try:
-            result = subprocess.run(
-                gs_command,
-                env=env,
-                startupinfo=startupinfo,
-                capture_output=True,
-                text=True,
-                shell=False,
-                check=False
-            )
-        except Exception as e:
-            QMessageBox.critical(self.main_window, "Ошибка сжатия", f"При сжатии произошла ошибка: {str(e)}")
-
-        if result.returncode != 0:
-            print("Ошибка Ghostscript:")
-            print(result.stderr)
-            QMessageBox.critical(self.main_window, "Ошибка сжатия", f"При сжатии произошла ошибка: {result.stderr}")
-            return
-        else:
-            if os.path.isfile(output_path):
-                print("Сжатие завершено")
-                print(f"Файл сохранен: {output_path}")
-                size_original = os.path.getsize(input_path) / 1024
-                size_compressed = os.path.getsize(output_path) / 1024
-
-                if size_compressed >= size_original:
-                    os.remove(output_path)
-                    QMessageBox.information(
-                        self.main_window,
-                        "",
-                        "Оригинальный документ уже сжат до минимального объёма.\n"
-                        "Новая сжатая версия не будет создана."
-                    )
-                    return
-
-                compressed_ratio = (1 - size_compressed / size_original) * 100
-                QMessageBox.information(
-                    self.main_window,
-                    "Сжатие завершено",
-                    f"Файл сохранён как: {output_path}\n\n"
-                    f"Размер исходного файла: {size_original:.1f} КБ\n"
-                    f"Размер сжатого файла: {size_compressed:.1f} КБ\n"
-                    f"Сжато на {compressed_ratio:.1f}%"
-                )
-            else:
-                print("Ghostscript отработал, но файл не создан")
-                print("STDOUT:", result.stdout)
-                print("STDERR:", result.stderr)
-                QMessageBox.critical(self.main_window, "Ошибка сохранения",
-                                     f"Сжатие произвелось, но произошла ошибка сохранения файла")
-
-    def save_message_box(self, title, text):
-        """Создает MessageBox с русскими кнопками"""
-        msg_box = QMessageBox(self.main_window)
-        msg_box.setWindowTitle(title)
-        msg_box.setText(text)
-        msg_box.setIcon(QMessageBox.Question)
-
-        # Добавляем кнопки с русским текстом
-        save_btn = msg_box.addButton("Сохранить", QMessageBox.YesRole)
-        discard_btn = msg_box.addButton("Не сохранять", QMessageBox.NoRole)
-        cancel_btn = msg_box.addButton("Отмена", QMessageBox.RejectRole)
-
-        msg_box.setDefaultButton(save_btn)
-        msg_box.exec()
-
-        button = msg_box.clickedButton()
-        role = msg_box.buttonRole(button)
-        return role
-
-        # clicked_button = msg_box.clickedButton()
-        # if clicked_button == save_btn:
-        #     return "save"
-        # elif clicked_button == discard_btn:
-        #     return "discard"
-        # elif clicked_button == cancel_btn:
-        #     return "cancel"
-
-    def email_document(self):
-        """Отправить текущий PDF документ по email."""
-        current_path = getattr(self.main_window, 'current_document_path', '')
-        if not current_path:
-            QMessageBox.warning(self.main_window, "Нет документа", "Пожалуйста, сначала откройте PDF файл.")
-            return
-
-        if getattr(self.main_window, 'is_document_modified', False):
-            clicked_button = self.save_message_box(
-                "",
-                "В документе есть несохранённые изменения. Хотите сохранить перед отправкой?"
-            )
-            if clicked_button == QMessageBox.RejectRole:
-                return
-            elif clicked_button == QMessageBox.YesRole:
-                if not self.save_file():
-                    return
-
-        from email_sender import EmailSender
-        EmailSender.send(self.main_window, current_path)
-
-    def move_page_up(self):
-        self._move_page_generic('move_page_up')
-
-    def move_page_down(self):
-        self._move_page_generic('move_page_down')
-
-    def _move_page_generic(self, method_name: str):
-        pv = getattr(self.ui, 'pdfView', None)
-        if hasattr(pv, method_name):
-            try:
-                success = bool(getattr(pv, method_name)())
-            except Exception:
-                success = False
-            if success:
-                if hasattr(self.main_window, 'on_document_modified'):
-                    self.main_window.on_document_modified(True)
-                else:
-                    self.main_window.is_document_modified = True
-                if hasattr(self.main_window, 'update_page_info'):
-                    self.main_window.update_page_info()
-                if hasattr(self.main_window, 'update_ui_state'):
-                    self.main_window.update_ui_state()
-                if hasattr(self.main_window, 'update_window_title'):
-                    self.main_window.update_window_title()
-
-                self.ui.thumbnailList.refresh_thumbnails(pv.document)
-
-    def rotate_page_clockwise(self):
-        self._rotate_page_generic(90)
-
-    def rotate_page_counterclockwise(self):
-        self._rotate_page_generic(-90)
-
-    def _rotate_page_generic(self, delta: int):
-        pv = getattr(self.ui, 'pdfView', None)
-        method = 'rotate_page_clockwise' if delta > 0 else 'rotate_page_counterclockwise'
-        success = False
-        if hasattr(pv, method):
-            try:
-                success = bool(getattr(pv, method)())
-            except Exception:
-                success = False
-        if not success and hasattr(pv, 'rotate_page'):
-            try:
-                success = bool(pv.rotate_page(delta))
-            except Exception:
-                success = False
-
-        if success:
-            if hasattr(self.main_window, 'on_document_modified'):
-                self.main_window.on_document_modified(True)
-            else:
-                self.main_window.is_document_modified = True
-            # Update corresponding thumbnail preview if supported
-            self.ui.thumbnailList.refresh_thumbnails(pv.document)
+if __name__ == "__main__":
+    main()
