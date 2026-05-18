@@ -1,409 +1,397 @@
-
-
-**Что такое RPM-пакет?** Это просто архив с твоей программой + инструкция по установке (`.spec`-файл). Когда пользователь ставит пакет, RPM сам раскладывает файлы куда надо.
-
-**Что такое PyInstaller?** Он берёт твой Python-проект и упаковывает его в один исполняемый файл — всё вместе: и Python, и все библиотеки. Этот файл можно запустить на любом Альт Linux без установки Python.
-
-**Наш план:**
-1. Собрать бинарник `AltPDF` через PyInstaller (на твоей машине с Linux)
-2. Упаковать этот бинарник в `.tar.gz` архив
-3. Создать `.spec`-файл с инструкцией для RPM
-4. Запустить `rpmbuild` — он создаст `.rpm`
-5. Протестировать установку
-
----
-
-## 🔧 Шаг 0 — Убедись что ты в правильном месте
-
-Открой Konsole. Сначала посмотрим где ты находишься:
-
-```bash
-pwd
-```
-
-И посмотрим структуру твоего проекта:
-
-```bash
-ls ~/
-```
-
-Нам надо найти твою папку с проектом. Скорее всего она называется что-то вроде `pdf_editor` или `AltPDF`. Допустим она в домашней папке — тогда перейди в неё:
-
-```bash
-cd ~/pdf_editor
-ls
-```
-
-Ты должна увидеть: `build/`, `classes/`, `dist/`, `icons/`, `venv/`, и файлы `.py`. Если это не так — напиши мне что видишь, поправим путь.
-
----
-
-## 📦 Шаг 1 — Установка инструментов для сборки
-
-Это нужно сделать один раз. Нужны права суперпользователя:
-
-```bash
-su
-```
-*(Введи пароль root-а)*
-
-```bash
-apt-get update
-apt-get install rpm-build rpmdevtools
-```
-
-```bash
-exit
-```
-*(Выходим обратно из root)*
-
-**Почему это нужно?** `rpm-build` — это сам инструмент сборки пакетов. `rpmdevtools` даёт удобную команду `rpmdev-setuptree` для создания нужной структуры папок.
-
----
-
-## 🏗️ Шаг 2 — Создать рабочее пространство RPM
-
-RPM ожидает строго определённую структуру папок в домашней директории. Создадим её автоматически:
-
-```bash
-rpmdev-setuptree
-```
-
-Проверим что получилось:
-
-```bash
-ls ~/rpmbuild/
-```
-
-Должно быть:
-```
-BUILD  RPMS  SOURCES  SPECS  SRPMS
-```
-
-**Что это за папки?**
-- `SOURCES` — сюда кладём архив с исходниками (наш `.tar.gz`)
-- `SPECS` — сюда кладём `.spec`-файл
-- `BUILD` — тут происходит сборка (временная)
-- `RPMS` — сюда попадает готовый `.rpm`
-- `SRPMS` — исходный пакет (нам пока не нужен)
-
----
-
-## ⚠️ Шаг 2.5 — Важный момент с `.rpmmacros`
-
-Если ты использовала `rpmdev-setuptree`, нужно проверить файл настроек:
-
-```bash
-cat ~/.rpmmacros
-```
-
-Если там есть блок `%__arch_install_post` — его **надо удалить**, иначе сборка будет падать с ошибкой. Открой файл:
-
-```bash
-nano ~/.rpmmacros
-```
-
-Файл должен выглядеть примерно вот так (без лишних блоков):
-
-```
-%_topdir        %{getenv:HOME}/rpmbuild
-%packager       Твоё Имя <email@example.com>
-```
-
-Удали всё лишнее, сохрани (`Ctrl+O`, `Enter`, `Ctrl+X`).
-
----
-
-## 🚀 Шаг 3 — Собрать бинарник через PyInstaller
-
-Это самый важный шаг. Нам нужен готовый исполняемый файл `AltPDF`.
-
-Перейди в папку проекта:
-
-```bash
-cd ~/pdf_editor
-```
-
-Активируй своё виртуальное окружение:
-
-```bash
-source venv/bin/activate
-```
-
-*(Подсказка: если venv называется иначе — замени `venv` на реальное имя)*
-
-Проверь что PyInstaller есть:
-
-```bash
-pyinstaller --version
-```
-
-Теперь запусти сборку через твой `.spec`-файл PyInstaller (не путать с RPM `.spec`!):
-
-```bash
-pyinstaller --clean --noconfirm AltPDF.spec
-```
-
-Подожди пока завершится. Потом проверь:
-
-```bash
-ls dist/
-```
-
-Ты должна увидеть файл `AltPDF`. Проверь что он работает:
-
-```bash
-./dist/AltPDF
-```
-
-Если приложение открылось — отлично! Закрой его и идём дальше.
-
-Деактивируй venv:
-
-```bash
-deactivate
-```
-
----
-
-## 📁 Шаг 4 — Создать архив с нужными файлами
-
-RPM хочет получить `.tar.gz` архив с исходниками. Мы кладём туда всё что нужно для сборки.
-
-Убедись что ты в папке проекта:
-
-```bash
-pwd
-# должно быть что-то вроде /home/user/pdf_editor
-```
-
-Теперь создаём архив. Команда немного длинная, но давай разберём её:
-
-```bash
-tar -czf ~/rpmbuild/SOURCES/altpdf-0.831.tar.gz \
-    --transform 's|^|altpdf-0.831/|' \
-    dist/AltPDF \
-    icons/ \
-    help.pdf
-```
-
-**Что здесь происходит?**
-- `-czf` — создать сжатый архив
-- `~/rpmbuild/SOURCES/altpdf-0.831.tar.gz` — куда сохранить
-- `--transform 's|^|altpdf-0.831/|'` — это магия: она добавляет папку `altpdf-0.831/` внутри архива (RPM требует такую структуру)
-- дальше перечислены файлы которые берём
-
-Проверь что архив создан:
-
-```bash
-ls -lh ~/rpmbuild/SOURCES/
-```
-
----
-
-## 📝 Шаг 5 — Обновить `.spec` файл
-
-Наш текущий `.spec` (тот что ты приложила) рассчитан на сборку из исходников через PyInstaller. Но это проблема: установка PySide6 через pip во время сборки пакета — занимает очень долго и требует интернета на сборочной машине.
-
-Более правильный подход — **положить уже готовый бинарник в архив** и в `.spec` просто его установить. Давай сделаем именно так:
-
-```bash
-nano ~/rpmbuild/SPECS/altpdf.spec
-```
-
-Вставь вот это содержимое (это упрощённая версия, без пересборки через PyInstaller):
-
-```spec
-Name:           altpdf
-Version:        0.831
-Release:        alt1
-Summary:        Редактор PDF файлов для Альт Рабочая станция
-License:        Proprietary
-Group:          Office
-URL:            https://sng.ru
-
-Source0:        %{name}-%{version}.tar.gz
-
-# PyInstaller уже включает Python и библиотеки внутри бинарника.
-# Нужны только базовые системные библиотеки:
-Requires:       libgcc1
-Requires:       glibc
-
-# Сборочных зависимостей почти нет — бинарник уже готов
-BuildArch:      x86_64
-
-%description
-Редактор PDF Альт — приложение для просмотра и редактирования PDF-файлов,
-разработанное для операционной системы Альт Рабочая станция.
-
-%prep
-%setup -q
-
-%build
-# Бинарник уже собран через PyInstaller — дополнительная сборка не нужна
-
-%install
-install -d %{buildroot}%{_bindir}
-install -d %{buildroot}%{_datadir}/%{name}
-install -d %{buildroot}%{_datadir}/applications
-install -d %{buildroot}%{_datadir}/icons/hicolor/256x256/apps
-
-# Устанавливаем готовый бинарник
-install -m 755 dist/AltPDF %{buildroot}%{_bindir}/altpdf
-
-# Устанавливаем help.pdf
-install -m 644 help.pdf %{buildroot}%{_datadir}/%{name}/help.pdf
-
-# Скрипт-обёртка (копирует help.pdf рядом с бинарником при первом запуске)
-cat > %{buildroot}%{_bindir}/altpdf-wrapper << 'EOF'
-#!/bin/sh
-HELP_SRC=%{_datadir}/%{name}/help.pdf
-HELP_DST=$(dirname $(readlink -f %{_bindir}/altpdf))/help.pdf
-[ -f "$HELP_DST" ] || cp "$HELP_SRC" "$HELP_DST" 2>/dev/null || true
-exec %{_bindir}/altpdf "$@"
-EOF
-chmod 755 %{buildroot}%{_bindir}/altpdf-wrapper
-
-# Ярлык в меню приложений
-cat > %{buildroot}%{_datadir}/applications/%{name}.desktop << 'EOF'
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Редактор PDF Альт
-Name[ru]=Редактор PDF Альт
-Comment=Просмотр и редактирование PDF-документов
-Comment[ru]=Просмотр и редактирование PDF-документов
-Exec=altpdf-wrapper %F
-Icon=altpdf
-MimeType=application/pdf;
-Categories=Office;Viewer;
-StartupNotify=true
-EOF
-
-# Иконка
-if command -v convert >/dev/null 2>&1; then
-    convert icons/icon.ico[0] \
-        %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/altpdf.png 2>/dev/null || \
-    cp icons/icon.ico \
-        %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/altpdf.png
-else
-    cp icons/icon.ico \
-        %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/altpdf.png
-fi
-
-%post
-/usr/bin/gtk-update-icon-cache -f -t %{_datadir}/icons/hicolor 2>/dev/null || true
-/usr/bin/update-desktop-database %{_datadir}/applications 2>/dev/null || true
-
-%postun
-/usr/bin/gtk-update-icon-cache -f -t %{_datadir}/icons/hicolor 2>/dev/null || true
-/usr/bin/update-desktop-database %{_datadir}/applications 2>/dev/null || true
-
-%files
-%{_bindir}/altpdf
-%{_bindir}/altpdf-wrapper
-%{_datadir}/%{name}/help.pdf
-%{_datadir}/applications/%{name}.desktop
-%{_datadir}/icons/hicolor/256x256/apps/altpdf.png
-
-%changelog
-* Thu Apr 29 2026 ОППО ГИСиСАПР <dev@sng.ru> - 0.831-alt1
-- Initial RPM packaging for Альт Рабочая станция
-```
-
-Сохрани: `Ctrl+O`, `Enter`, `Ctrl+X`.
-
----
-
-## 🔨 Шаг 6 — Собрать RPM пакет
-
-Теперь запускаем сборку! Команда `-bb` означает «собери только бинарный пакет» (без исходников):
-
-```bash
-rpmbuild -bb ~/rpmbuild/SPECS/altpdf.spec
-```
-
-Смотри на вывод. Если всё хорошо — в конце увидишь что-то вроде:
-
-```
-Wrote: /home/user/rpmbuild/RPMS/x86_64/altpdf-0.831-alt1.x86_64.rpm
-```
-
-Если увидела ошибки — скопируй их и покажи мне, разберёмся вместе!
-
-Проверь что пакет появился:
-
-```bash
-ls ~/rpmbuild/RPMS/x86_64/
-```
-
----
-
-## 🧪 Шаг 7 — Проверить пакет перед установкой
-
-Посмотрим что внутри пакета (без установки):
-
-```bash
-rpm -qpl ~/rpmbuild/RPMS/x86_64/altpdf-0.831-alt1.x86_64.rpm
-```
-
-Это покажет список файлов которые войдут в систему при установке. Убедись что там есть `/usr/bin/altpdf`.
-
----
-
-## 📥 Шаг 8 — Установить и протестировать
-
-```bash
-su
-```
-
-```bash
-rpm -ivh ~/rpmbuild/RPMS/x86_64/altpdf-0.831-alt1.x86_64.rpm
-```
-
-Флаги: `-i` установить, `-v` подробный вывод, `-h` прогресс-бар.
-
-Выйди из root:
-
-```bash
-exit
-```
-
-Проверь что программа запускается:
-
-```bash
-altpdf
-```
-
-И через ярлык — посмотри в меню приложений, там должен появиться «Редактор PDF Альт».
-
----
-
-## ❌ Как удалить (для повторного тестирования)
-
-```bash
-su
-rpm -e altpdf
-exit
-```
-
----
-
-## 🚚 Распространение на 1000 машин
-
-Когда пакет готов и протестирован — тебе нужно просто скопировать файл `altpdf-0.831-alt1.x86_64.rpm` на все машины и запустить `rpm -ivh altpdf-0.831-alt1.x86_64.rpm` (или через централизованную систему управления). Пакет самодостаточный — всё внутри.
-
----
-
-## 🆘 Частые проблемы
-
-| Проблема | Что делать |
-|---|---|
-| `rpmbuild: command not found` | Установи `rpm-build` через `apt-get` |
-| Ошибка `%setup` — не может распаковать | Проверь что архив в `~/rpmbuild/SOURCES/` и имя совпадает с `Source0` в `.spec` |
-| `No such file: dist/AltPDF` | Проверь что в архив попал файл `dist/AltPDF` |
-| Программа запускается но падает | Скорее всего не хватает какой-то системной библиотеки — нужно добавить в `Requires` |
-
----
-
-Попробуй пройти по шагам и на каком шаге что-то пойдёт не так — пиши! Я здесь 🙂
+#!/usr/bin/env python3
+"""
+File Hash Calculator - PySide6 GUI Application
+Recursively computes MD5 and/or SHA256 hashes for all files in a selected directory.
+"""
+
+import hashlib
+import sys
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, List, Dict
+
+from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QProgressBar, QTextEdit,
+    QCheckBox, QFileDialog, QMessageBox, QGroupBox, QGridLayout
+)
+from PySide6.QtGui import QFont, QTextCursor
+
+# Configuration - Adjust these values as needed
+HASH_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB buffer for reading files (change this value)
+# Common alternatives:
+# HASH_BUFFER_SIZE = 64 * 1024      # 64 KB (original)
+# HASH_BUFFER_SIZE = 1 * 1024 * 1024  # 1 MB
+# HASH_BUFFER_SIZE = 8 * 1024 * 1024  # 8 MB
+
+
+class HashWorker(QThread):
+    """Background worker for recursive file hashing."""
+    # Signals to communicate with the GUI
+    progress_updated = Signal(int, int)          # current_file_index, total_files
+    current_file = Signal(str)                   # file name being processed
+    file_result = Signal(dict)                   # result for one file (for live log)
+    error_occurred = Signal(str, str)            # error message, file path
+    finished_success = Signal(int, int)          # total_files, error_count
+    cancelled = Signal()
+
+    def __init__(self, source_dir: Path, output_path: Path,
+                 compute_md5: bool, compute_sha256: bool,
+                 buffer_size: int = HASH_BUFFER_SIZE):
+        super().__init__()
+        self.source_dir = source_dir
+        self.output_path = output_path
+        self.compute_md5 = compute_md5
+        self.compute_sha256 = compute_sha256
+        self.buffer_size = buffer_size  # Configurable buffer size
+        self._is_cancelled = False
+
+    def cancel(self):
+        """Request cancellation of the running operation."""
+        self._is_cancelled = True
+
+    def _hash_file(self, file_path: Path, algorithm: str) -> str:
+        """
+        Compute hash of a file using chunked reading.
+        algorithm: 'md5' or 'sha256'
+        Returns hexadecimal digest as string.
+        """
+        hash_func = hashlib.md5() if algorithm == 'md5' else hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            # Read file in configurable chunks to avoid loading huge files into memory
+            # Using self.buffer_size (set to HASH_BUFFER_SIZE constant)
+            for chunk in iter(lambda: f.read(self.buffer_size), b''):
+                if self._is_cancelled:  # Allow cancellation during long file reads
+                    raise InterruptedError("Operation cancelled")
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+
+    def run(self):
+        """Main worker method (runs in separate thread)."""
+        # Collect all file paths recursively
+        all_files = list(self.source_dir.rglob('*'))
+        # Filter only files (not directories)
+        all_files = [f for f in all_files if f.is_file()]
+        total = len(all_files)
+        results = []          # store results for final output
+        error_count = 0
+
+        for idx, file_path in enumerate(all_files, start=1):
+            if self._is_cancelled:
+                self.cancelled.emit()
+                return
+
+            self.progress_updated.emit(idx, total)
+            self.current_file.emit(file_path.name)
+
+            try:
+                md5_hash = None
+                sha256_hash = None
+                if self.compute_md5:
+                    md5_hash = self._hash_file(file_path, 'md5')
+                if self.compute_sha256:
+                    sha256_hash = self._hash_file(file_path, 'sha256')
+
+                result = {
+                    'number': idx,
+                    'filename': file_path.name,
+                    'full_path': str(file_path),
+                    'md5': md5_hash.upper() if md5_hash else 'NOT COMPUTED',
+                    'sha256': sha256_hash.upper() if sha256_hash else 'NOT COMPUTED',
+                }
+                results.append(result)
+                self.file_result.emit(result)
+
+            except PermissionError:
+                error_count += 1
+                err_msg = f"Permission denied: {file_path.name}"
+                self.error_occurred.emit(err_msg, str(file_path))
+                # Still include an error placeholder
+                results.append({
+                    'number': idx,
+                    'filename': file_path.name,
+                    'full_path': str(file_path),
+                    'md5': 'ERROR (Permission)',
+                    'sha256': 'ERROR (Permission)',
+                })
+            except InterruptedError:
+                # Cancellation during file reading
+                self.cancelled.emit()
+                return
+            except Exception as e:
+                error_count += 1
+                err_msg = f"Failed: {file_path.name} - {str(e)}"
+                self.error_occurred.emit(err_msg, str(file_path))
+                results.append({
+                    'number': idx,
+                    'filename': file_path.name,
+                    'full_path': str(file_path),
+                    'md5': 'ERROR',
+                    'sha256': 'ERROR',
+                })
+
+        # Write output file
+        self._write_output(results, total, error_count)
+        self.finished_success.emit(total, error_count)
+
+    def _write_output(self, results: List[Dict], total: int, error_count: int):
+        """
+        Write results to the output file in the required format.
+        """
+        try:
+            with open(self.output_path, 'w', encoding='utf-8') as f:
+                for r in results:
+                    f.write(f"FILE #{r['number']}\n")
+                    f.write(f"FILENAME: {r['filename']}\n")
+                    f.write(f"MD5: {r['md5']}\n")
+                    f.write(f"SHA256: {r['sha256']}\n\n")
+                f.write(f"Total files processed: {total}\n")
+                if error_count > 0:
+                    f.write(f"Errors: {error_count}\n")
+        except Exception as e:
+            self.error_occurred.emit(f"Failed to write output file: {e}", "")
+
+
+class HashApp(QMainWindow):
+    """Main application window."""
+    def __init__(self):
+        super().__init__()
+        self.worker: Optional[HashWorker] = None
+        self.source_dir: Optional[Path] = None
+        self.output_path: Optional[Path] = None
+        self.init_ui()
+        self.statusBar().showMessage(f"Using {self._format_buffer_size(HASH_BUFFER_SIZE)} buffer for file reading")
+
+    def _format_buffer_size(self, size_bytes: int) -> str:
+        """Convert bytes to human-readable format."""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} TB"
+
+    def init_ui(self):
+        """Set up the user interface."""
+        self.setWindowTitle("File Hash Calculator (MD5 / SHA256)")
+        self.setMinimumSize(700, 600)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # --- Source directory selection ---
+        dir_group = QGroupBox("Source Directory")
+        dir_layout = QHBoxLayout()
+        self.source_line = QLineEdit()
+        self.source_line.setReadOnly(True)
+        self.source_line.setPlaceholderText("Select a folder containing files to hash...")
+        self.browse_dir_btn = QPushButton("Browse...")
+        self.browse_dir_btn.clicked.connect(self.browse_source_directory)
+        dir_layout.addWidget(self.source_line)
+        dir_layout.addWidget(self.browse_dir_btn)
+        dir_group.setLayout(dir_layout)
+        main_layout.addWidget(dir_group)
+
+        # --- Output file selection ---
+        out_group = QGroupBox("Output File")
+        out_layout = QHBoxLayout()
+        self.output_line = QLineEdit()
+        self.output_line.setReadOnly(True)
+        self.output_line.setPlaceholderText("Where to save the checksum results...")
+        self.browse_out_btn = QPushButton("Save As...")
+        self.browse_out_btn.clicked.connect(self.browse_output_file)
+        out_layout.addWidget(self.output_line)
+        out_layout.addWidget(self.browse_out_btn)
+        out_group.setLayout(out_layout)
+        main_layout.addWidget(out_group)
+
+        # --- Hash algorithm selection ---
+        algo_group = QGroupBox("Hashing Options")
+        algo_layout = QHBoxLayout()
+        self.md5_cb = QCheckBox("Compute MD5")
+        self.md5_cb.setChecked(True)
+        self.sha256_cb = QCheckBox("Compute SHA256")
+        self.sha256_cb.setChecked(True)
+        algo_layout.addWidget(self.md5_cb)
+        algo_layout.addWidget(self.sha256_cb)
+        algo_layout.addStretch()
+        
+        # Buffer size display (read-only info)
+        buffer_label = QLabel(f"Read buffer: {self._format_buffer_size(HASH_BUFFER_SIZE)}")
+        buffer_label.setStyleSheet("color: gray; font-size: 10pt;")
+        algo_layout.addWidget(buffer_label)
+        
+        algo_group.setLayout(algo_layout)
+        main_layout.addWidget(algo_group)
+
+        # --- Progress area ---
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.current_file_label = QLabel("Ready")
+        self.current_file_label.setWordWrap(True)
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.current_file_label)
+        progress_group.setLayout(progress_layout)
+        main_layout.addWidget(progress_group)
+
+        # --- Control buttons ---
+        button_layout = QHBoxLayout()
+        self.start_btn = QPushButton("Start Hashing")
+        self.start_btn.clicked.connect(self.start_hashing)
+        self.start_btn.setEnabled(False)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.cancel_hashing)
+        self.cancel_btn.setEnabled(False)
+        button_layout.addWidget(self.start_btn)
+        button_layout.addWidget(self.cancel_btn)
+        button_layout.addStretch()
+        main_layout.addLayout(button_layout)
+
+        # --- Log area (live results and errors) ---
+        log_group = QGroupBox("Live Log")
+        log_layout = QVBoxLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
+        main_layout.addWidget(log_group)
+
+        # Status bar
+        self.statusBar().showMessage("Select a source directory and output file")
+
+    def browse_source_directory(self):
+        """Open dialog to pick the source folder."""
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Source Directory")
+        if dir_path:
+            self.source_dir = Path(dir_path)
+            self.source_line.setText(str(self.source_dir))
+            self.check_start_enabled()
+
+    def browse_output_file(self):
+        """Open dialog to choose output file path (.txt suggested)."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Results As", "",
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if file_path:
+            self.output_path = Path(file_path)
+            self.output_line.setText(str(self.output_path))
+            self.check_start_enabled()
+
+    def check_start_enabled(self):
+        """Enable Start button only if both source and output are selected."""
+        if self.source_dir and self.output_path and (self.md5_cb.isChecked() or self.sha256_cb.isChecked()):
+            self.start_btn.setEnabled(True)
+        else:
+            self.start_btn.setEnabled(False)
+
+    def start_hashing(self):
+        """Start the background hashing worker."""
+        if not self.source_dir or not self.output_path:
+            return
+
+        # Clear previous log
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.current_file_label.setText("Starting...")
+
+        # Disable UI elements during processing
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.browse_dir_btn.setEnabled(False)
+        self.browse_out_btn.setEnabled(False)
+        self.md5_cb.setEnabled(False)
+        self.sha256_cb.setEnabled(False)
+
+        # Create and start worker thread with configurable buffer size
+        self.worker = HashWorker(
+            source_dir=self.source_dir,
+            output_path=self.output_path,
+            compute_md5=self.md5_cb.isChecked(),
+            compute_sha256=self.sha256_cb.isChecked(),
+            buffer_size=HASH_BUFFER_SIZE  # Pass the buffer size to worker
+        )
+        # Connect signals
+        self.worker.progress_updated.connect(self.update_progress)
+        self.worker.current_file.connect(self.update_current_file)
+        self.worker.file_result.connect(self.log_file_result)
+        self.worker.error_occurred.connect(self.log_error)
+        self.worker.finished_success.connect(self.on_finished)
+        self.worker.cancelled.connect(self.on_cancelled)
+        self.worker.start()
+        
+        self.statusBar().showMessage(f"Hashing started with {self._format_buffer_size(HASH_BUFFER_SIZE)} buffer...")
+
+    def cancel_hashing(self):
+        """Request cancellation from the worker thread."""
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.statusBar().showMessage("Cancelling... (may take a moment)")
+
+    def update_progress(self, current: int, total: int):
+        """Update progress bar."""
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+
+    def update_current_file(self, filename: str):
+        """Update the label showing the current file."""
+        self.current_file_label.setText(f"Processing: {filename}")
+
+    def log_file_result(self, result: dict):
+        """Append a successful file's result to the log area."""
+        # Use HTML for colored highlighting (optional)
+        msg = (f"<b>FILE #{result['number']}</b><br>"
+               f"📄 {result['filename']}<br>"
+               f"MD5: {result['md5']}<br>"
+               f"SHA256: {result['sha256']}<br><br>")
+        self.log_text.append(msg)
+        # Auto-scroll to bottom
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
+
+    def log_error(self, error_msg: str, file_path: str):
+        """Append an error message to the log area."""
+        self.log_text.append(f"<font color='red'><b>ERROR:</b> {error_msg}</font>")
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
+
+    def on_finished(self, total_files: int, error_count: int):
+        """Handle successful completion."""
+        self.reset_ui()
+        msg = f"✅ Completed! Processed {total_files} files. "
+        if error_count:
+            msg += f"Errors: {error_count}. "
+        msg += f"Results saved to {self.output_path}"
+        self.statusBar().showMessage(msg)
+        QMessageBox.information(self, "Completed", msg)
+
+    def on_cancelled(self):
+        """Handle user cancellation."""
+        self.reset_ui()
+        self.statusBar().showMessage("Operation cancelled by user.")
+        self.log_text.append("<font color='orange'><b>CANCELLED</b> by user.</font>")
+
+    def reset_ui(self):
+        """Re-enable UI elements after worker finishes or is cancelled."""
+        self.cancel_btn.setEnabled(False)
+        self.start_btn.setEnabled(True)
+        self.browse_dir_btn.setEnabled(True)
+        self.browse_out_btn.setEnabled(True)
+        self.md5_cb.setEnabled(True)
+        self.sha256_cb.setEnabled(True)
+        self.current_file_label.setText("Ready")
+        # Re-check start condition in case of changes
+        self.check_start_enabled()
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = HashApp()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
