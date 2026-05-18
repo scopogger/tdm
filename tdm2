@@ -1,496 +1,804 @@
 #!/usr/bin/env python3
 """
-HashKit - File Hash Calculator with Modern UI
-Supports drag & drop, expandable file rows, MD5/SHA256 hashing, and live log.
+HashKit - File Hash Calculator
+Light theme, animated row collapse, persistent live log, no save-file dialog.
 """
 
 import hashlib
 import sys
 import os
 from pathlib import Path
-from typing import Optional, List, Dict, Set
-from datetime import datetime
-
-from PySide6.QtCore import QThread, Signal, Qt, QMutex, QMutexLocker
+from typing import Optional, List, Dict
+from PySide6.QtCore import (
+    QThread, Signal, Qt, QMutex, QMutexLocker,
+    QPropertyAnimation, QEasingCurve, QRect, QTimer, QSize
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QLineEdit, QProgressBar, QTextEdit,
+    QPushButton, QLabel, QProgressBar, QTextEdit,
     QCheckBox, QFileDialog, QMessageBox, QGroupBox, QListWidget,
-    QListWidgetItem, QScrollArea, QFrame, QSizePolicy, QAbstractItemView
+    QListWidgetItem, QSizePolicy, QAbstractItemView, QFrame
 )
 from PySide6.QtGui import (
-    QFont, QTextCursor, QDragEnterEvent, QDropEvent, QClipboard,
-    QFontDatabase, QColor, QPalette
+    QFont, QTextCursor, QDragEnterEvent, QDropEvent,
+    QColor, QPalette, QLinearGradient, QGradient, QBrush
 )
 
-# Configuration
-HASH_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB buffer
+
+# ─── Light palette forced for all OS modes ────────────────────────────────────
+LIGHT_STYLESHEET = """
+QMainWindow, QWidget {
+    background-color: #f5f6fa;
+    color: #2d2d2d;
+    font-family: 'Segoe UI', 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif;
+    font-size: 13px;
+}
+
+QGroupBox {
+    background-color: #ffffff;
+    border: 1px solid #dde1ea;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 12px;
+    font-weight: 600;
+    color: #444;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: #666;
+}
+
+QPushButton {
+    background-color: #ffffff;
+    color: #2d2d2d;
+    border: 1px solid #d0d5e0;
+    border-radius: 6px;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background-color: #eef2ff;
+    border-color: #aab8f5;
+}
+QPushButton:pressed {
+    background-color: #dde5ff;
+}
+QPushButton:disabled {
+    background-color: #f0f0f0;
+    color: #aaaaaa;
+    border-color: #e0e0e0;
+}
+
+QPushButton#primaryBtn {
+    background-color: #4a6cf7;
+    color: white;
+    border: none;
+    font-weight: 600;
+    padding: 6px 20px;
+}
+QPushButton#primaryBtn:hover {
+    background-color: #3d5ee8;
+}
+QPushButton#primaryBtn:disabled {
+    background-color: #c5cdf7;
+    color: #eef0ff;
+}
+
+QPushButton#dangerBtn {
+    background-color: #fff0f0;
+    color: #e53e3e;
+    border: 1px solid #fcc;
+}
+QPushButton#dangerBtn:hover {
+    background-color: #ffe0e0;
+}
+
+QListWidget {
+    background-color: #ffffff;
+    border: 1px solid #dde1ea;
+    border-radius: 8px;
+    outline: none;
+}
+QListWidget::item {
+    padding: 0px;
+    border: none;
+}
+QListWidget::item:selected {
+    background: transparent;
+}
+
+QTextEdit {
+    background-color: #1e2030;
+    color: #c0caf5;
+    border: 1px solid #3d4166;
+    border-radius: 8px;
+    font-family: 'Consolas', 'JetBrains Mono', 'Courier New', monospace;
+    font-size: 11px;
+    padding: 6px;
+}
+
+QProgressBar {
+    background-color: #e8eaf6;
+    border: none;
+    border-radius: 4px;
+    height: 6px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background-color: #4a6cf7;
+    border-radius: 4px;
+}
+
+QCheckBox {
+    spacing: 6px;
+    color: #444;
+    font-size: 12px;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 2px solid #c0c8e0;
+    border-radius: 4px;
+    background: white;
+}
+QCheckBox::indicator:checked {
+    background-color: #4a6cf7;
+    border-color: #4a6cf7;
+    image: none;
+}
+
+QLabel {
+    color: #444;
+    background: transparent;
+}
+
+QScrollBar:vertical {
+    background: #f0f2f8;
+    width: 8px;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical {
+    background: #c8cedf;
+    border-radius: 4px;
+    min-height: 20px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QStatusBar {
+    background-color: #eef0f8;
+    color: #666;
+    border-top: 1px solid #dde1ea;
+    font-size: 11px;
+    padding: 2px 8px;
+}
+"""
 
 
+def apply_light_palette(app: QApplication):
+    """Force light palette regardless of OS dark/light mode."""
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor("#f5f6fa"))
+    pal.setColor(QPalette.WindowText, QColor("#2d2d2d"))
+    pal.setColor(QPalette.Base, QColor("#ffffff"))
+    pal.setColor(QPalette.AlternateBase, QColor("#f0f2f8"))
+    pal.setColor(QPalette.ToolTipBase, QColor("#ffffff"))
+    pal.setColor(QPalette.ToolTipText, QColor("#2d2d2d"))
+    pal.setColor(QPalette.Text, QColor("#2d2d2d"))
+    pal.setColor(QPalette.Button, QColor("#ffffff"))
+    pal.setColor(QPalette.ButtonText, QColor("#2d2d2d"))
+    pal.setColor(QPalette.BrightText, QColor("#ff0000"))
+    pal.setColor(QPalette.Link, QColor("#4a6cf7"))
+    pal.setColor(QPalette.Highlight, QColor("#4a6cf7"))
+    pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    pal.setColor(QPalette.Disabled, QPalette.Text, QColor("#aaaaaa"))
+    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor("#aaaaaa"))
+    app.setPalette(pal)
+
+
+# ─── Hash worker ──────────────────────────────────────────────────────────────
 class HashWorker(QThread):
-    """Background worker that hashes a list of files."""
-    # Signals
-    file_started = Signal(str)           # file path (when processing begins)
-    file_progress = Signal(int, int)      # current index, total count
-    file_result = Signal(str, str, str)   # file_path, md5 (or empty), sha256 (or empty)
-    file_error = Signal(str, str)         # file_path, error message
-    finished = Signal(int, int)           # total files, error count
-    cancelled = Signal()
+    file_started  = Signal(str)
+    file_progress = Signal(int, int)
+    file_result   = Signal(str, str, str)   # path, md5, sha256
+    file_error    = Signal(str, str)
+    finished      = Signal(int, int)
+    cancelled     = Signal()
 
     def __init__(self, file_list: List[Path], compute_md5: bool, compute_sha256: bool):
         super().__init__()
-        self.file_list = file_list
-        self.compute_md5 = compute_md5
+        self.file_list      = file_list
+        self.compute_md5    = compute_md5
         self.compute_sha256 = compute_sha256
-        self._is_cancelled = False
-        self._mutex = QMutex()
+        self._is_cancelled  = False
+        self._mutex         = QMutex()
 
     def cancel(self):
         with QMutexLocker(self._mutex):
             self._is_cancelled = True
 
-    def _is_cancelled_safe(self) -> bool:
+    def _cancelled(self) -> bool:
         with QMutexLocker(self._mutex):
             return self._is_cancelled
 
     def _hash_file(self, file_path: Path, algorithm: str) -> str:
-        """Hash a single file with chunked reading."""
-        hash_func = hashlib.md5() if algorithm == 'md5' else hashlib.sha256()
+        h = hashlib.md5() if algorithm == 'md5' else hashlib.sha256()
         with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(HASH_BUFFER_SIZE), b''):
-                if self._is_cancelled_safe():
-                    raise InterruptedError("Cancelled")
-                hash_func.update(chunk)
-        return hash_func.hexdigest()
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                if self._cancelled():
+                    raise InterruptedError()
+                h.update(chunk)
+        return h.hexdigest()
 
     def run(self):
         total = len(self.file_list)
-        error_count = 0
-
-        for idx, file_path in enumerate(self.file_list, start=1):
-            if self._is_cancelled_safe():
+        errors = 0
+        for idx, fp in enumerate(self.file_list, 1):
+            if self._cancelled():
                 self.cancelled.emit()
                 return
-
             self.file_progress.emit(idx, total)
-            self.file_started.emit(str(file_path))
-
-            md5_hash = ""
-            sha256_hash = ""
-
+            self.file_started.emit(str(fp))
+            md5 = sha256 = ""
             try:
                 if self.compute_md5:
-                    md5_hash = self._hash_file(file_path, 'md5').upper()
+                    md5 = self._hash_file(fp, 'md5').upper()
                 if self.compute_sha256:
-                    sha256_hash = self._hash_file(file_path, 'sha256').upper()
-                self.file_result.emit(str(file_path), md5_hash, sha256_hash)
+                    sha256 = self._hash_file(fp, 'sha256').upper()
+                self.file_result.emit(str(fp), md5, sha256)
             except InterruptedError:
                 self.cancelled.emit()
                 return
             except Exception as e:
-                error_count += 1
-                self.file_error.emit(str(file_path), str(e))
-                # Still emit result with error placeholders
-                self.file_result.emit(str(file_path), "ERROR", "ERROR")
-
-        self.finished.emit(total, error_count)
+                errors += 1
+                self.file_error.emit(str(fp), str(e))
+                self.file_result.emit(str(fp), "ERROR", "ERROR")
+        self.finished.emit(total, errors)
 
 
-class FileRowWidget(QWidget):
-    """Custom widget for each file in the list: expandable, shows hashes, copy button."""
-    copy_requested = Signal(str, str, str)   # file_path, md5, sha256
-    remove_requested = Signal(object)        # self (the row widget)
+# ─── File row widget ───────────────────────────────────────────────────────────
+class FileRowWidget(QFrame):
+    """
+    Expanded state  : number | icon | name | [copy-name] [copy-hash] [collapse] [remove]
+                      ── MD5:  xxxxxxxx
+                      ── SHA256: yyyyyyyy
+    Collapsed state : number | icon | name | [expand] [remove]   (single line)
+
+    Copy interactions:
+      • click filename label  → flash blue → copy filename to clipboard
+      • click hash label      → flash blue → copy that hash to clipboard
+      • when BOTH name+hash copied → 2s sweep animation → collapse row
+    """
+    remove_requested = Signal(object)
+
+    _BASE_BG    = "#ffffff"
+    _FLASH_BG   = "#dde8ff"   # temporary copy flash
+    _SWEEP_BG   = "#c8d9ff"   # sweep animation color
+    _DONE_BG    = "#f5f8ff"   # resting collapsed bg
 
     def __init__(self, file_path: Path, index: int, parent=None):
         super().__init__(parent)
-        self.file_path = file_path
-        self.index = index
-        self.md5 = ""
-        self.sha256 = ""
-        self.is_expanded = True
-        self.hashes_ready = False
-
-        self._init_ui()
-        self._set_expanded_state(True)
-
-    def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(3)
-
-        # Top row: number, icon, name, buttons
-        top_row = QHBoxLayout()
-        top_row.setSpacing(10)
-
-        # File number
-        self.num_label = QLabel(f"{self.index}.")
-        self.num_label.setFixedWidth(35)
-        top_row.addWidget(self.num_label)
-
-        # Icon label (using emoji for simplicity; could use font icons)
-        self.icon_label = QLabel(self._get_file_icon())
-        self.icon_label.setFixedWidth(30)
-        top_row.addWidget(self.icon_label)
-
-        # File name (no path)
-        self.name_label = QLabel(self.file_path.name)
-        self.name_label.setWordWrap(False)
-        self.name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        top_row.addWidget(self.name_label)
-
-        # Copy button (only visible when expanded and hashes ready)
-        self.copy_btn = QPushButton("📋")
-        self.copy_btn.setFixedSize(30, 30)
-        self.copy_btn.setToolTip("Copy MD5 and SHA256")
-        self.copy_btn.clicked.connect(self._on_copy)
-        top_row.addWidget(self.copy_btn)
-
-        # Expand/collapse button
-        self.toggle_btn = QPushButton("▲")
-        self.toggle_btn.setFixedSize(30, 30)
-        self.toggle_btn.setToolTip("Collapse")
-        self.toggle_btn.clicked.connect(self._on_toggle)
-        top_row.addWidget(self.toggle_btn)
-
-        # Remove button
-        self.remove_btn = QPushButton("✖")
-        self.remove_btn.setFixedSize(30, 30)
-        self.remove_btn.setToolTip("Remove from list")
-        self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
-        top_row.addWidget(self.remove_btn)
-
-        layout.addLayout(top_row)
-
-        # Bottom row (hash info, visible only when expanded)
-        self.hash_widget = QWidget()
-        hash_layout = QHBoxLayout(self.hash_widget)
-        hash_layout.setContentsMargins(35, 0, 0, 0)  # indent
-        self.md5_label = QLabel("MD5: ")
-        self.sha256_label = QLabel("SHA256: ")
-        hash_layout.addWidget(self.md5_label)
-        hash_layout.addWidget(self.sha256_label)
-        hash_layout.addStretch()
-        layout.addWidget(self.hash_widget)
+        self.file_path   = file_path
+        self.index       = index
+        self.md5         = ""
+        self.sha256      = ""
+        self.hashes_ready     = False
+        self._name_copied     = False
+        self._hash_copied     = False
+        self._is_collapsed    = False
+        self._sweep_timer     = None
+        self._flash_timers: List[QTimer] = []
 
         self.setAutoFillBackground(True)
+        self.setObjectName("fileRow")
+        self._set_bg(self._BASE_BG)
+        self._init_ui()
 
-    def _get_file_icon(self) -> str:
-        """Return an emoji icon based on file extension."""
+    # ── UI construction ────────────────────────────────────────────────────
+    def _init_ui(self):
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(8, 6, 8, 6)
+        self._outer.setSpacing(4)
+
+        # ── Top row ────────────────────────────────────────────────────────
+        self._top_row = QHBoxLayout()
+        self._top_row.setSpacing(8)
+
+        self._num_lbl = QLabel(f"{self.index}.")
+        self._num_lbl.setFixedWidth(28)
+        self._num_lbl.setStyleSheet("color:#999; font-size:11px;")
+        self._top_row.addWidget(self._num_lbl)
+
+        self._icon_lbl = QLabel(self._file_icon())
+        self._icon_lbl.setFixedWidth(22)
+        self._top_row.addWidget(self._icon_lbl)
+
+        # Clickable filename label
+        self._name_lbl = QLabel(self.file_path.name)
+        self._name_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._name_lbl.setToolTip(str(self.file_path))
+        self._name_lbl.setCursor(Qt.PointingHandCursor)
+        self._name_lbl.setStyleSheet(
+            "font-weight: 500; color: #2d2d2d; padding: 2px 0;"
+        )
+        self._name_lbl.mousePressEvent = lambda e: self._on_copy_name()
+        self._top_row.addWidget(self._name_lbl)
+
+        # Collapse / expand button
+        self._toggle_btn = self._make_icon_btn("▲", "Collapse")
+        self._toggle_btn.clicked.connect(self._on_toggle)
+        self._top_row.addWidget(self._toggle_btn)
+
+        # Remove button
+        self._remove_btn = self._make_icon_btn("✕", "Remove")
+        self._remove_btn.setObjectName("dangerBtn")
+        self._remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        self._top_row.addWidget(self._remove_btn)
+
+        self._outer.addLayout(self._top_row)
+
+        # ── Hash sub-row ────────────────────────────────────────────────────
+        self._hash_frame = QWidget()
+        hash_layout = QVBoxLayout(self._hash_frame)
+        hash_layout.setContentsMargins(52, 0, 0, 2)
+        hash_layout.setSpacing(2)
+
+        self._md5_lbl = QLabel("MD5:  —")
+        self._sha256_lbl = QLabel("SHA256:  —")
+        for lbl in (self._md5_lbl, self._sha256_lbl):
+            lbl.setStyleSheet(
+                "font-family: 'Consolas','JetBrains Mono','Courier New',monospace;"
+                "font-size: 11px; color: #555; padding: 1px 0;"
+            )
+            lbl.setCursor(Qt.PointingHandCursor)
+            lbl.setWordWrap(False)
+        self._md5_lbl.mousePressEvent    = lambda e: self._on_copy_hash("md5")
+        self._sha256_lbl.mousePressEvent = lambda e: self._on_copy_hash("sha256")
+
+        hash_layout.addWidget(self._md5_lbl)
+        hash_layout.addWidget(self._sha256_lbl)
+        self._outer.addWidget(self._hash_frame)
+
+    def _make_icon_btn(self, text: str, tip: str) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setFixedSize(28, 28)
+        btn.setToolTip(tip)
+        btn.setStyleSheet(
+            "QPushButton { font-size: 11px; padding: 0; border-radius: 5px; }"
+        )
+        return btn
+
+    # ── File icon ──────────────────────────────────────────────────────────
+    def _file_icon(self) -> str:
         ext = self.file_path.suffix.lower()
-        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
-            return "🖼️"
-        elif ext in ['.mp4', '.mkv', '.avi', '.mov']:
-            return "🎬"
-        elif ext in ['.mp3', '.wav', '.flac']:
-            return "🎵"
-        elif ext in ['.pdf']:
-            return "📄"
-        elif ext in ['.doc', '.docx']:
-            return "📝"
-        elif ext in ['.zip', '.rar', '.7z', '.tar', '.gz']:
-            return "🗜️"
-        elif ext in ['.exe', '.msi']:
-            return "⚙️"
-        elif ext in ['.py', '.js', '.html', '.css', '.cpp', '.c']:
-            return "💻"
-        else:
-            return "📁"
+        icons = {
+            frozenset(['.jpg','.jpeg','.png','.gif','.bmp','.webp']): "🖼️",
+            frozenset(['.mp4','.mkv','.avi','.mov','.wmv']): "🎬",
+            frozenset(['.mp3','.wav','.flac','.ogg','.aac']): "🎵",
+            frozenset(['.pdf']): "📄",
+            frozenset(['.doc','.docx']): "📝",
+            frozenset(['.zip','.rar','.7z','.tar','.gz','.xz']): "🗜️",
+            frozenset(['.exe','.msi','.dmg','.deb']): "⚙️",
+            frozenset(['.py','.js','.ts','.html','.css','.cpp','.c','.rs']): "💻",
+            frozenset(['.xls','.xlsx','.csv']): "📊",
+        }
+        for ext_set, icon in icons.items():
+            if ext in ext_set:
+                return icon
+        return "📁"
 
+    # ── Hash population ────────────────────────────────────────────────────
     def set_hashes(self, md5: str, sha256: str):
-        self.md5 = md5.upper() if md5 and md5 != "ERROR" else md5
-        self.sha256 = sha256.upper() if sha256 and sha256 != "ERROR" else sha256
+        self.md5  = md5.upper() if md5  not in ("", "ERROR") else md5
+        self.sha256 = sha256.upper() if sha256 not in ("", "ERROR") else sha256
         self.hashes_ready = True
-        self.md5_label.setText(f"MD5: {self.md5}")
-        self.sha256_label.setText(f"SHA256: {self.sha256}")
-        # Enable copy button only if expanded and hashes are valid (not ERROR)
-        if self.is_expanded and self.md5 != "ERROR" and self.sha256 != "ERROR":
-            self.copy_btn.setEnabled(True)
-        else:
-            self.copy_btn.setEnabled(False)
+        self._md5_lbl.setText(
+            f"<span style='color:#888'>MD5</span>&nbsp;&nbsp; {self._fmt(self.md5)}"
+        )
+        self._sha256_lbl.setText(
+            f"<span style='color:#888'>SHA256</span> {self._fmt(self.sha256)}"
+        )
+        self._md5_lbl.setTextFormat(Qt.RichText)
+        self._sha256_lbl.setTextFormat(Qt.RichText)
 
-    def _on_copy(self):
-        if not self.hashes_ready or not self.is_expanded:
+        # Reset copy state whenever new hashes arrive
+        self._name_copied = False
+        self._hash_copied = False
+
+    def _fmt(self, val: str) -> str:
+        if val == "ERROR":
+            return "<span style='color:#e53e3e'>ERROR</span>"
+        return f"<span style='color:#333;font-weight:500'>{val}</span>"
+
+    # ── Copy interactions ──────────────────────────────────────────────────
+    def _on_copy_name(self):
+        QApplication.clipboard().setText(self.file_path.name)
+        self._flash_widget(self._name_lbl)
+        self._name_copied = True
+        self._check_both_copied()
+
+    def _on_copy_hash(self, which: str):
+        if not self.hashes_ready:
             return
-        # Copy both hashes to clipboard
-        clipboard = QApplication.clipboard()
-        text = f"MD5: {self.md5}\nSHA256: {self.sha256}"
-        clipboard.setText(text)
-        # Auto-collapse after copy
-        self._set_expanded_state(False)
-        # Emit a signal to notify parent? Not needed, but can show status
-        parent = self.parent()
-        while parent and not isinstance(parent, QMainWindow):
-            parent = parent.parent()
-        if parent:
-            parent.statusBar().showMessage("Hashes copied, row collapsed", 2000)
+        val = self.md5 if which == "md5" else self.sha256
+        if val in ("", "ERROR"):
+            return
+        QApplication.clipboard().setText(val)
+        lbl = self._md5_lbl if which == "md5" else self._sha256_lbl
+        self._flash_widget(lbl)
+        self._hash_copied = True
+        self._check_both_copied()
 
-    def _on_toggle(self):
-        self._set_expanded_state(not self.is_expanded)
+    def _flash_widget(self, widget: QLabel, duration_ms: int = 500):
+        """Brief blue background flash on the given label."""
+        orig = widget.styleSheet()
+        widget.setStyleSheet(
+            orig + "background-color: #c8d9ff; border-radius: 3px;"
+        )
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.timeout.connect(lambda: widget.setStyleSheet(orig))
+        t.start(duration_ms)
+        self._flash_timers.append(t)
 
-    def _set_expanded_state(self, expanded: bool):
-        self.is_expanded = expanded
-        self.hash_widget.setVisible(expanded)
-        if expanded:
-            self.toggle_btn.setText("▲")
-            self.toggle_btn.setToolTip("Collapse")
-            # Restore normal appearance
-            pal = self.palette()
-            pal.setColor(QPalette.Window, QColor(255, 255, 255))
-            self.setPalette(pal)
-            self.name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            # Show copy button only if hashes are ready and not errors
-            if self.hashes_ready and self.md5 != "ERROR" and self.sha256 != "ERROR":
-                self.copy_btn.setVisible(True)
-                self.copy_btn.setEnabled(True)
-            else:
-                self.copy_btn.setVisible(False)
+    def _check_both_copied(self):
+        if self._name_copied and self._hash_copied:
+            self._start_sweep_collapse()
+
+    # ── Sweep-then-collapse animation ─────────────────────────────────────
+    def _start_sweep_collapse(self):
+        """2-second right-to-left blue sweep, then collapse."""
+        # We'll do a timer-driven pseudo-sweep by animating background via
+        # stepping through stylesheet updates (Qt doesn't support gradient animation
+        # easily, so we simulate with a QTimer stepping the gradient position).
+        self._sweep_step = 0
+        self._sweep_total = 40   # steps over 2 seconds
+        self._sweep_timer = QTimer(self)
+        self._sweep_timer.setInterval(50)   # 50ms × 40 = 2 s
+        self._sweep_timer.timeout.connect(self._sweep_tick)
+        self._sweep_timer.start()
+
+    def _sweep_tick(self):
+        step  = self._sweep_step
+        total = self._sweep_total
+        if step > total:
+            self._sweep_timer.stop()
+            self._do_collapse()
+            return
+
+        # progress 0→1 right-to-left:  highlight starts from right, sweeps to left
+        # We simulate with a gradient: at step=0 color is on the right;
+        # at step=total color is on the left; then collapse.
+        progress = step / total   # 0.0 → 1.0
+        # The "lit" portion grows from right: right side = 1.0, left = progress
+        pct_right = max(0, int((1.0 - progress) * 100))
+        pct_left  = 100 - pct_right
+
+        color_lit = "#b8cdff"
+        color_base = "#ffffff"
+
+        if pct_left <= 0:
+            bg = f"background-color: {color_base};"
+        elif pct_right <= 0:
+            bg = f"background-color: {color_lit};"
         else:
-            self.toggle_btn.setText("▼")
-            self.toggle_btn.setToolTip("Expand")
-            # Gray out and disable text selection
-            pal = self.palette()
-            gray_color = QColor(180, 180, 180)
-            pal.setColor(QPalette.Window, QColor(240, 240, 240))
-            pal.setColor(QPalette.WindowText, gray_color)
-            self.setPalette(pal)
-            self.num_label.setPalette(pal)
-            self.icon_label.setPalette(pal)
-            self.name_label.setPalette(pal)
-            self.name_label.setTextInteractionFlags(Qt.NoTextInteraction)
-            self.copy_btn.setVisible(False)
+            bg = (
+                f"background: qlineargradient("
+                f"x1:0, y1:0, x2:1, y2:0, "
+                f"stop:0 {color_lit}, "
+                f"stop:{progress:.3f} {color_lit}, "
+                f"stop:{min(progress+0.05,1):.3f} {color_base}, "
+                f"stop:1 {color_base}"
+                f");"
+            )
+
+        self.setStyleSheet(f"QFrame#fileRow {{ {bg} }}")
+        self._sweep_step += 1
+
+    def _do_collapse(self):
+        self.setStyleSheet(f"QFrame#fileRow {{ background-color: {self._DONE_BG}; }}")
+        self._set_collapsed(True)
+
+    # ── Toggle expand/collapse ─────────────────────────────────────────────
+    def _on_toggle(self):
+        self._set_collapsed(not self._is_collapsed)
+
+    def _set_collapsed(self, collapsed: bool):
+        self._is_collapsed = collapsed
+        self._hash_frame.setVisible(not collapsed)
+        if collapsed:
+            self._toggle_btn.setText("▼")
+            self._toggle_btn.setToolTip("Expand")
+            self._name_lbl.setStyleSheet(
+                "font-weight: 500; color: #6a7a9a; padding: 2px 0;"
+            )
+        else:
+            self._toggle_btn.setText("▲")
+            self._toggle_btn.setToolTip("Collapse")
+            self._name_lbl.setStyleSheet(
+                "font-weight: 500; color: #2d2d2d; padding: 2px 0;"
+            )
+            # Reset copy state on re-expand
+            self._name_copied = False
+            self._hash_copied = False
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+    def _set_bg(self, color: str):
+        pal = self.palette()
+        pal.setColor(QPalette.Window, QColor(color))
+        self.setPalette(pal)
+
+    def update_index(self, idx: int):
+        self.index = idx
+        self._num_lbl.setText(f"{idx}.")
 
 
+# ─── Main window ──────────────────────────────────────────────────────────────
 class HashKitWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker: Optional[HashWorker] = None
-        self.file_rows: Dict[str, FileRowWidget] = {}  # path -> row widget
-        self.file_paths: List[Path] = []               # ordered list
-        self.output_path: Optional[Path] = None
-        self.compute_md5 = True
+        self.file_rows:  Dict[str, FileRowWidget] = {}
+        self.file_paths: List[Path] = []
+        self.compute_md5    = True
         self.compute_sha256 = True
+        self._log_lines: List[str] = []   # always stored, even when log hidden
         self._init_ui()
         self.setAcceptDrops(True)
 
+    # ── UI construction ────────────────────────────────────────────────────
     def _init_ui(self):
-        self.setWindowTitle("HashKit - File Hash Calculator")
-        self.setMinimumSize(900, 700)
+        self.setWindowTitle("HashKit")
+        self.setMinimumSize(820, 640)
 
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(16, 14, 16, 10)
+        root.setSpacing(10)
 
-        # Output file selection row
-        out_layout = QHBoxLayout()
-        out_layout.addWidget(QLabel("Save results:"))
-        self.output_line = QLineEdit()
-        self.output_line.setReadOnly(True)
-        self.output_line.setPlaceholderText("Select output file...")
-        out_layout.addWidget(self.output_line)
-        self.browse_out_btn = QPushButton("Browse")
-        self.browse_out_btn.clicked.connect(self._browse_output)
-        out_layout.addWidget(self.browse_out_btn)
-        main_layout.addLayout(out_layout)
+        # ── Top toolbar ────────────────────────────────────────────────────
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
 
-        # Options row: MD5/SHA256 toggles, Clear All, Show Live Log
-        opts_layout = QHBoxLayout()
-        self.md5_cb = QCheckBox("MD5")
-        self.md5_cb.setChecked(True)
-        self.sha256_cb = QCheckBox("SHA256")
-        self.sha256_cb.setChecked(True)
-        self.md5_cb.toggled.connect(self._update_hash_options)
-        self.sha256_cb.toggled.connect(self._update_hash_options)
-        self.clear_all_btn = QPushButton("Clear All")
-        self.clear_all_btn.clicked.connect(self._clear_all_files)
-        self.live_log_toggle = QCheckBox("Show Live Log")
-        self.live_log_toggle.setChecked(False)
-        self.live_log_toggle.toggled.connect(self._toggle_live_log)
-        opts_layout.addWidget(self.md5_cb)
-        opts_layout.addWidget(self.sha256_cb)
-        opts_layout.addStretch()
-        opts_layout.addWidget(self.clear_all_btn)
-        opts_layout.addWidget(self.live_log_toggle)
-        main_layout.addLayout(opts_layout)
+        self._add_files_btn = QPushButton("+ Add Files")
+        self._add_files_btn.setObjectName("primaryBtn")
+        self._add_files_btn.setToolTip("Select individual files to add")
+        self._add_files_btn.clicked.connect(self._browse_add_files)
+        toolbar.addWidget(self._add_files_btn)
 
-        # File list (scrollable)
-        self.file_list_widget = QListWidget()
-        self.file_list_widget.setDragEnabled(False)
-        self.file_list_widget.setAcceptDrops(True)
-        self.file_list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.file_list_widget.setDropIndicatorShown(True)
-        self.file_list_widget.viewport().setAcceptDrops(True)
-        self.file_list_widget.setDragDropMode(QAbstractItemView.InternalMove)  # not used
-        main_layout.addWidget(QLabel("Files to process (drag & drop files/folders here):"))
-        main_layout.addWidget(self.file_list_widget)
+        self._add_folder_btn = QPushButton("+ Add Folder")
+        self._add_folder_btn.setToolTip("Add all files from a folder recursively")
+        self._add_folder_btn.clicked.connect(self._browse_add_folder)
+        toolbar.addWidget(self._add_folder_btn)
 
-        # Live log (initially hidden)
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas", 9))
-        self.log_text.setVisible(False)
-        main_layout.addWidget(self.log_text)
+        toolbar.addSpacing(8)
 
-        # Progress area
-        progress_group = QGroupBox("Progress")
+        self._md5_cb = QCheckBox("MD5")
+        self._md5_cb.setChecked(True)
+        self._sha256_cb = QCheckBox("SHA256")
+        self._sha256_cb.setChecked(True)
+        self._md5_cb.toggled.connect(self._update_opts)
+        self._sha256_cb.toggled.connect(self._update_opts)
+        toolbar.addWidget(self._md5_cb)
+        toolbar.addWidget(self._sha256_cb)
+
+        toolbar.addStretch()
+
+        self._log_toggle = QCheckBox("Live Log")
+        self._log_toggle.setChecked(False)
+        self._log_toggle.toggled.connect(self._toggle_log)
+        toolbar.addWidget(self._log_toggle)
+
+        self._clear_btn = QPushButton("Clear All")
+        self._clear_btn.setObjectName("dangerBtn")
+        self._clear_btn.clicked.connect(self._clear_all)
+        toolbar.addWidget(self._clear_btn)
+
+        root.addLayout(toolbar)
+
+        # ── Drop hint label ────────────────────────────────────────────────
+        self._drop_hint = QLabel("Drop files or folders anywhere · or use the buttons above")
+        self._drop_hint.setAlignment(Qt.AlignCenter)
+        self._drop_hint.setStyleSheet(
+            "color: #aaa; font-size: 12px; padding: 4px 0;"
+        )
+        root.addWidget(self._drop_hint)
+
+        # ── File list ──────────────────────────────────────────────────────
+        self._file_list = QListWidget()
+        self._file_list.setDragEnabled(False)
+        self._file_list.setAcceptDrops(True)
+        self._file_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self._file_list.setFocusPolicy(Qt.NoFocus)
+        self._file_list.viewport().setAcceptDrops(True)
+        root.addWidget(self._file_list, stretch=1)
+
+        # ── Live log (hidden by default, but always populated) ─────────────
+        self._log_text = QTextEdit()
+        self._log_text.setReadOnly(True)
+        self._log_text.setVisible(False)
+        self._log_text.setMaximumHeight(160)
+        root.addWidget(self._log_text)
+
+        # ── Progress ───────────────────────────────────────────────────────
+        prog_group = QGroupBox("Progress")
         prog_layout = QVBoxLayout()
-        self.progress_bar = QProgressBar()
-        self.current_file_label = QLabel("Ready")
-        self.current_file_label.setWordWrap(True)
-        prog_layout.addWidget(self.progress_bar)
-        prog_layout.addWidget(self.current_file_label)
-        progress_group.setLayout(prog_layout)
-        main_layout.addWidget(progress_group)
+        prog_layout.setSpacing(4)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setTextVisible(False)
+        self._current_lbl  = QLabel("Ready")
+        self._current_lbl.setStyleSheet("font-size: 11px; color: #777;")
+        prog_layout.addWidget(self._progress_bar)
+        prog_layout.addWidget(self._current_lbl)
+        prog_group.setLayout(prog_layout)
+        root.addWidget(prog_group)
 
-        # Start / Cancel buttons
-        btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("Start Hashing")
-        self.start_btn.clicked.connect(self._start_hashing)
-        self.start_btn.setEnabled(False)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.clicked.connect(self._cancel_hashing)
-        self.cancel_btn.setEnabled(False)
-        btn_layout.addWidget(self.start_btn)
-        btn_layout.addWidget(self.cancel_btn)
-        btn_layout.addStretch()
-        main_layout.addLayout(btn_layout)
+        # ── Action buttons ─────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        self._start_btn  = QPushButton("▶  Start Hashing")
+        self._start_btn.setObjectName("primaryBtn")
+        self._start_btn.setEnabled(False)
+        self._start_btn.clicked.connect(self._start_hashing)
 
-        self.statusBar().showMessage("Drag and drop files/folders or select output file first")
+        self._cancel_btn = QPushButton("✕  Cancel")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self._cancel_hashing)
 
-    def _browse_output(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Results As", "", "Text Files (*.txt)")
-        if path:
-            self.output_path = Path(path)
-            self.output_line.setText(str(self.output_path))
-            self._update_start_button()
+        btn_row.addWidget(self._start_btn)
+        btn_row.addWidget(self._cancel_btn)
+        btn_row.addStretch()
+        root.addLayout(btn_row)
 
-    def _update_hash_options(self):
-        self.compute_md5 = self.md5_cb.isChecked()
-        self.compute_sha256 = self.sha256_cb.isChecked()
-        self._update_start_button()
+        self.statusBar().showMessage("Drag & drop files here or use + Add Files")
 
-    def _update_start_button(self):
-        enabled = (len(self.file_paths) > 0 and self.output_path is not None and
-                   (self.compute_md5 or self.compute_sha256))
-        self.start_btn.setEnabled(enabled)
+    # ── File addition ──────────────────────────────────────────────────────
+    def _browse_add_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Files to Hash", "",
+            "All Files (*.*)"
+        )
+        added = sum(self._add_file(Path(p)) for p in paths)
+        if added:
+            self._update_start_btn()
+            self.statusBar().showMessage(f"Added {added} file(s)", 3000)
 
-    def _clear_all_files(self):
-        self.file_list_widget.clear()
-        self.file_rows.clear()
-        self.file_paths.clear()
-        self._update_start_button()
-        self.statusBar().showMessage("Cleared all files")
+    def _browse_add_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder")
+        if folder:
+            added = self._add_folder(Path(folder))
+            if added:
+                self._update_start_btn()
+                self.statusBar().showMessage(f"Added {added} file(s) from folder", 3000)
 
-    def _toggle_live_log(self, checked):
-        self.log_text.setVisible(checked)
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if not urls:
-            return
-        added_count = 0
-        for url in urls:
-            path = Path(url.toLocalFile())
-            if path.exists():
-                if path.is_file():
-                    added_count += self._add_file(path)
-                elif path.is_dir():
-                    added_count += self._add_folder(path)
-        if added_count > 0:
-            self._update_start_button()
-            self.statusBar().showMessage(f"Added {added_count} new file(s)", 3000)
-        event.acceptProposedAction()
-
-    def _add_file(self, file_path: Path) -> int:
-        """Add a single file to the list if not already present."""
-        str_path = str(file_path.resolve())
-        if str_path in self.file_rows:
+    def _add_file(self, fp: Path) -> int:
+        key = str(fp.resolve())
+        if key in self.file_rows:
             return 0
-        self.file_paths.append(file_path)
-        row_widget = FileRowWidget(file_path, len(self.file_paths))
-        row_widget.remove_requested.connect(self._remove_row)
-        # Store for later updates
-        self.file_rows[str_path] = row_widget
-        # Insert into QListWidget
+        self.file_paths.append(fp)
+        row = FileRowWidget(fp, len(self.file_paths))
+        row.remove_requested.connect(self._remove_row)
+        self.file_rows[key] = row
+
         item = QListWidgetItem()
-        self.file_list_widget.addItem(item)
-        item.setSizeHint(row_widget.sizeHint())
-        self.file_list_widget.setItemWidget(item, row_widget)
+        self._file_list.addItem(item)
+        item.setSizeHint(row.sizeHint())
+        self._file_list.setItemWidget(item, row)
+
+        # Update drop hint
+        self._drop_hint.setVisible(len(self.file_paths) == 0)
         return 1
 
-    def _add_folder(self, folder_path: Path) -> int:
-        """Recursively add all files from folder."""
+    def _add_folder(self, folder: Path) -> int:
         added = 0
-        for file_path in folder_path.rglob("*"):
-            if file_path.is_file():
-                added += self._add_file(file_path)
+        for fp in sorted(folder.rglob("*")):
+            if fp.is_file():
+                added += self._add_file(fp)
         return added
 
-    def _remove_row(self, row_widget: FileRowWidget):
-        """Remove a file row from the list."""
-        path_str = str(row_widget.file_path.resolve())
-        if path_str in self.file_rows:
-            del self.file_rows[path_str]
-        # Remove from file_paths list
+    def _remove_row(self, row: FileRowWidget):
+        key = str(row.file_path.resolve())
+        if key in self.file_rows:
+            del self.file_rows[key]
         for i, p in enumerate(self.file_paths):
-            if str(p.resolve()) == path_str:
+            if str(p.resolve()) == key:
                 self.file_paths.pop(i)
                 break
-        # Remove from list widget
-        for i in range(self.file_list_widget.count()):
-            item = self.file_list_widget.item(i)
-            if self.file_list_widget.itemWidget(item) == row_widget:
-                self.file_list_widget.takeItem(i)
+        for i in range(self._file_list.count()):
+            item = self._file_list.item(i)
+            if self._file_list.itemWidget(item) is row:
+                self._file_list.takeItem(i)
                 break
-        # Renumber remaining rows
-        self._renumber_rows()
-        self._update_start_button()
+        self._renumber()
+        self._update_start_btn()
+        self._drop_hint.setVisible(len(self.file_paths) == 0)
         self.statusBar().showMessage("File removed", 2000)
 
-    def _renumber_rows(self):
-        """Update the index numbers on all rows after removal."""
-        for i in range(self.file_list_widget.count()):
-            item = self.file_list_widget.item(i)
-            widget = self.file_list_widget.itemWidget(item)
-            if isinstance(widget, FileRowWidget):
-                widget.index = i + 1
-                widget.num_label.setText(f"{widget.index}.")
+    def _renumber(self):
+        for i in range(self._file_list.count()):
+            item = self._file_list.item(i)
+            w = self._file_list.itemWidget(item)
+            if isinstance(w, FileRowWidget):
+                w.update_index(i + 1)
 
+    def _clear_all(self):
+        self._file_list.clear()
+        self.file_rows.clear()
+        self.file_paths.clear()
+        self._drop_hint.setVisible(True)
+        self._update_start_btn()
+        self.statusBar().showMessage("Cleared", 2000)
+
+    # ── Drag & drop ────────────────────────────────────────────────────────
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e: QDropEvent):
+        added = 0
+        for url in e.mimeData().urls():
+            p = Path(url.toLocalFile())
+            if p.is_file():
+                added += self._add_file(p)
+            elif p.is_dir():
+                added += self._add_folder(p)
+        if added:
+            self._update_start_btn()
+            self.statusBar().showMessage(f"Added {added} file(s)", 3000)
+        e.acceptProposedAction()
+
+    # ── Options & start button ──────────────────────────────────────────────
+    def _update_opts(self):
+        self.compute_md5    = self._md5_cb.isChecked()
+        self.compute_sha256 = self._sha256_cb.isChecked()
+        self._update_start_btn()
+
+    def _update_start_btn(self):
+        ok = bool(self.file_paths) and (self.compute_md5 or self.compute_sha256)
+        self._start_btn.setEnabled(ok)
+
+    # ── Live log ───────────────────────────────────────────────────────────
+    def _toggle_log(self, checked: bool):
+        self._log_text.setVisible(checked)
+        if checked:
+            # Replay stored lines so the widget is up to date
+            self._log_text.setPlainText("\n".join(self._log_lines))
+            self._log_text.moveCursor(QTextCursor.End)
+
+    def _log(self, line: str):
+        """Always store, optionally show."""
+        self._log_lines.append(line)
+        if self._log_toggle.isChecked():
+            self._log_text.append(line)
+            self._log_text.moveCursor(QTextCursor.End)
+
+    # ── Hashing ────────────────────────────────────────────────────────────
     def _start_hashing(self):
-        if not self.file_paths or not self.output_path:
-            return
-        if not (self.compute_md5 or self.compute_sha256):
-            QMessageBox.warning(self, "Warning", "Select at least one hash algorithm")
+        if not self.file_paths or not (self.compute_md5 or self.compute_sha256):
             return
 
-        # Disable UI
-        self.start_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
-        self.clear_all_btn.setEnabled(False)
-        self.browse_out_btn.setEnabled(False)
-        self.md5_cb.setEnabled(False)
-        self.sha256_cb.setEnabled(False)
-        self.file_list_widget.setAcceptDrops(False)
-
-        # Clear any existing hashes in rows (but keep rows)
+        # Reset hashes in existing rows
         for row in self.file_rows.values():
             row.set_hashes("", "")
             row.hashes_ready = False
 
-        self.progress_bar.setValue(0)
-        self.current_file_label.setText("Starting...")
+        self._log_lines.clear()
+        if self._log_toggle.isChecked():
+            self._log_text.clear()
 
-        # Create worker with current file list
+        self._set_ui_busy(True)
+        self._progress_bar.setValue(0)
+        self._current_lbl.setText("Starting…")
+
         self.worker = HashWorker(self.file_paths, self.compute_md5, self.compute_sha256)
-        self.worker.file_started.connect(self._on_file_started)
+        self.worker.file_started.connect(self._on_started)
         self.worker.file_progress.connect(self._on_progress)
-        self.worker.file_result.connect(self._on_file_result)
-        self.worker.file_error.connect(self._on_file_error)
+        self.worker.file_result.connect(self._on_result)
+        self.worker.file_error.connect(self._on_error)
         self.worker.finished.connect(self._on_finished)
         self.worker.cancelled.connect(self._on_cancelled)
         self.worker.start()
@@ -498,101 +806,64 @@ class HashKitWindow(QMainWindow):
     def _cancel_hashing(self):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
-            self.statusBar().showMessage("Cancelling...")
 
-    def _on_file_started(self, path_str: str):
-        # Highlight current row
-        for i in range(self.file_list_widget.count()):
-            item = self.file_list_widget.item(i)
-            widget = self.file_list_widget.itemWidget(item)
-            if str(widget.file_path.resolve()) == path_str:
-                widget.setStyleSheet("background-color: #e0f0ff;")
-            else:
-                widget.setStyleSheet("")
-        self.current_file_label.setText(f"Hashing: {Path(path_str).name}")
+    def _on_started(self, path_str: str):
+        name = Path(path_str).name
+        self._current_lbl.setText(f"Hashing: {name}")
 
-    def _on_progress(self, current: int, total: int):
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(current)
+    def _on_progress(self, cur: int, total: int):
+        self._progress_bar.setMaximum(total)
+        self._progress_bar.setValue(cur)
 
-    def _on_file_result(self, path_str: str, md5: str, sha256: str):
+    def _on_result(self, path_str: str, md5: str, sha256: str):
         row = self.file_rows.get(path_str)
         if row:
             row.set_hashes(md5, sha256)
-            # Also log to live log if visible
-            if self.live_log_toggle.isChecked():
-                self.log_text.append(f"✅ {Path(path_str).name} - MD5: {md5} SHA256: {sha256}")
-                self.log_text.moveCursor(QTextCursor.End)
-        # Remove highlight
-        for i in range(self.file_list_widget.count()):
-            item = self.file_list_widget.item(i)
-            widget = self.file_list_widget.itemWidget(item)
-            if str(widget.file_path.resolve()) == path_str:
-                widget.setStyleSheet("")
-                break
+            # Resize list item to fit new content
+            for i in range(self._file_list.count()):
+                item = self._file_list.item(i)
+                if self._file_list.itemWidget(item) is row:
+                    item.setSizeHint(row.sizeHint())
+                    break
+        self._log(f"✓ {Path(path_str).name}  md5={md5}  sha256={sha256}")
 
-    def _on_file_error(self, path_str: str, error_msg: str):
-        row = self.file_rows.get(path_str)
-        if row:
-            row.set_hashes("ERROR", "ERROR")
-        if self.live_log_toggle.isChecked():
-            self.log_text.append(f"❌ {Path(path_str).name}: {error_msg}")
-            self.log_text.moveCursor(QTextCursor.End)
+    def _on_error(self, path_str: str, msg: str):
+        self._log(f"✗ {Path(path_str).name}: {msg}")
 
-    def _on_finished(self, total: int, error_count: int):
-        self._reset_ui()
-        # Write output file
-        self._write_output_file(total, error_count)
-        msg = f"Hashing completed. Processed {total} files, errors: {error_count}. Results saved to {self.output_path}"
-        self.statusBar().showMessage(msg)
-        QMessageBox.information(self, "Complete", msg)
+    def _on_finished(self, total: int, errors: int):
+        self._set_ui_busy(False)
+        self._current_lbl.setText("Done")
+        msg = f"Hashed {total} file(s)"
+        if errors:
+            msg += f", {errors} error(s)"
+        self.statusBar().showMessage(msg, 6000)
+        self._log(f"─── {msg} ───")
 
     def _on_cancelled(self):
-        self._reset_ui()
-        self.statusBar().showMessage("Cancelled by user")
-        if self.live_log_toggle.isChecked():
-            self.log_text.append("⚠️ Operation cancelled")
+        self._set_ui_busy(False)
+        self._current_lbl.setText("Cancelled")
+        self.statusBar().showMessage("Cancelled", 4000)
+        self._log("─── Cancelled ───")
 
-    def _reset_ui(self):
-        self.cancel_btn.setEnabled(False)
-        self.start_btn.setEnabled(True)
-        self.clear_all_btn.setEnabled(True)
-        self.browse_out_btn.setEnabled(True)
-        self.md5_cb.setEnabled(True)
-        self.sha256_cb.setEnabled(True)
-        self.file_list_widget.setAcceptDrops(True)
-        self.current_file_label.setText("Ready")
-        self.progress_bar.setValue(0)
-        # Remove any row highlights
-        for i in range(self.file_list_widget.count()):
-            item = self.file_list_widget.item(i)
-            widget = self.file_list_widget.itemWidget(item)
-            widget.setStyleSheet("")
-
-    def _write_output_file(self, total: int, error_count: int):
-        if not self.output_path:
-            return
-        try:
-            with open(self.output_path, 'w', encoding='utf-8') as f:
-                for idx, file_path in enumerate(self.file_paths, start=1):
-                    row = self.file_rows.get(str(file_path.resolve()))
-                    md5_val = row.md5 if row and row.hashes_ready else "NOT COMPUTED"
-                    sha256_val = row.sha256 if row and row.hashes_ready else "NOT COMPUTED"
-                    f.write(f"FILE #{idx}\n")
-                    f.write(f"FILENAME: {file_path.name}\n")
-                    f.write(f"MD5: {md5_val}\n")
-                    f.write(f"SHA256: {sha256_val}\n\n")
-                f.write(f"Total files processed: {total}\n")
-                if error_count > 0:
-                    f.write(f"Errors: {error_count}\n")
-        except Exception as e:
-            QMessageBox.warning(self, "Write Error", f"Failed to write output file:\n{e}")
+    def _set_ui_busy(self, busy: bool):
+        self._start_btn.setEnabled(not busy)
+        self._cancel_btn.setEnabled(busy)
+        self._clear_btn.setEnabled(not busy)
+        self._add_files_btn.setEnabled(not busy)
+        self._add_folder_btn.setEnabled(not busy)
+        self._md5_cb.setEnabled(not busy)
+        self._sha256_cb.setEnabled(not busy)
+        if not busy:
+            self._progress_bar.setValue(0)
 
 
+# ─── Entry point ──────────────────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)
-    # Try to load a nicer font for icons (optional)
-    # You could load Font Awesome if available, but we use emojis.
+    app.setStyle("Fusion")
+    apply_light_palette(app)
+    app.setStyleSheet(LIGHT_STYLESHEET)
+
     window = HashKitWindow()
     window.show()
     sys.exit(app.exec())
