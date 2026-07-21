@@ -1,4 +1,4 @@
-# classes/native_file_dialog.py
+import os
 import shutil
 import subprocess
 import sys
@@ -9,13 +9,47 @@ from PySide6.QtWidgets import QFileDialog
 
 class NativeFileDialog:
     """Drop-in replacement for QFileDialog.getSaveFileName/getOpenFileName.
-    On Linux with kdialog available, uses it instead (same KIO widget Dolphin
-    uses — real smb:// / sftp:// browsing). Falls back to the plain Qt dialog
-    everywhere else, same pattern as EmailSender."""
+    On Linux with a working kdialog, uses it (same KIO widget Dolphin uses).
+    Falls back to the plain Qt dialog if kdialog is missing or broken."""
+
+    _kdialog_ok = None  # cached: None = untested, True/False = result
+
+    @staticmethod
+    def _clean_env() -> dict:
+        """Undo PyInstaller's bundled LD_LIBRARY_PATH for spawned processes —
+        same fix already used for ghostscript in compress_pdf()."""
+        env = os.environ.copy()
+        if sys.platform.startswith("linux"):
+            if 'LD_LIBRARY_PATH_ORIG' in env:
+                env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
+            else:
+                env.pop('LD_LIBRARY_PATH', None)
+        return env
 
     @staticmethod
     def _kdialog_available() -> bool:
-        return sys.platform.startswith("linux") and shutil.which("kdialog") is not None
+        if not sys.platform.startswith("linux"):
+            return False
+        if NativeFileDialog._kdialog_ok is not None:
+            return NativeFileDialog._kdialog_ok
+        if shutil.which("kdialog") is None:
+            NativeFileDialog._kdialog_ok = False
+            return False
+        try:
+            # cheap self-test — catches the frozen-app library problem before
+            # it can ever hang/fail a real modal Save/Open call
+            result = subprocess.run(
+                ["kdialog", "--version"],
+                capture_output=True, text=True, timeout=5,
+                env=NativeFileDialog._clean_env(),
+            )
+            NativeFileDialog._kdialog_ok = (result.returncode == 0)
+            if not NativeFileDialog._kdialog_ok:
+                print(f"[NativeFileDialog] kdialog self-test exit {result.returncode}: {result.stderr.strip()}")
+        except Exception as e:
+            print(f"[NativeFileDialog] kdialog self-test failed, using Qt dialogs: {e}")
+            NativeFileDialog._kdialog_ok = False
+        return NativeFileDialog._kdialog_ok
 
     @staticmethod
     def _url_to_path(raw: str) -> str:
@@ -23,36 +57,44 @@ class NativeFileDialog:
         parsed = urlparse(raw)
         if parsed.scheme in ("", "file"):
             return unquote(parsed.path) if parsed.scheme == "file" else raw
-        return raw  # smb://, sftp:// etc — see note below
+        return raw  # smb://, sftp:// etc — not a local path yet
+
+    @staticmethod
+    def _run_kdialog(args: list):
+        """Returns the chosen path/URL, "" on a real cancel, or None if
+        kdialog itself looks broken (caller should fall back to Qt)."""
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True,
+                env=NativeFileDialog._clean_env(),
+            )
+        except Exception as e:
+            print(f"[NativeFileDialog] kdialog call failed: {e}")
+            return None
+
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        if result.returncode == 1 and not result.stderr.strip():
+            return ""  # normal cancel
+        print(f"[NativeFileDialog] kdialog exit {result.returncode}: {result.stderr.strip()}")
+        return None
 
     @staticmethod
     def get_save_file_name(parent, caption: str, directory: str, filter: str):
         if NativeFileDialog._kdialog_available():
-            try:
-                result = subprocess.run(
-                    ["kdialog", "--title", caption, "--getsaveurl", directory, filter],
-                    capture_output=True, text=True
-                )
-                if result.returncode != 0:
-                    return "", ""  # user cancelled
-                if result.stdout.strip():
-                    return NativeFileDialog._url_to_path(result.stdout.strip()), filter
-            except Exception as e:
-                print(f"[NativeFileDialog] kdialog save failed, falling back: {e}")
+            raw = NativeFileDialog._run_kdialog(
+                ["kdialog", "--title", caption, "--getsaveurl", directory, filter]
+            )
+            if raw is not None:
+                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
         return QFileDialog.getSaveFileName(parent, caption, directory, filter)
 
     @staticmethod
     def get_open_file_name(parent, caption: str, directory: str, filter: str):
         if NativeFileDialog._kdialog_available():
-            try:
-                result = subprocess.run(
-                    ["kdialog", "--title", caption, "--getopenurl", directory, filter],
-                    capture_output=True, text=True
-                )
-                if result.returncode != 0:
-                    return "", ""
-                if result.stdout.strip():
-                    return NativeFileDialog._url_to_path(result.stdout.strip()), filter
-            except Exception as e:
-                print(f"[NativeFileDialog] kdialog open failed, falling back: {e}")
+            raw = NativeFileDialog._run_kdialog(
+                ["kdialog", "--title", caption, "--getopenurl", directory, filter]
+            )
+            if raw is not None:
+                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
         return QFileDialog.getOpenFileName(parent, caption, directory, filter)
