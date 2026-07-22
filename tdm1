@@ -1,9 +1,7 @@
-# classes/native_file_dialog.py — full file
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from urllib.parse import urlparse, unquote
 
 from PySide6.QtWidgets import QFileDialog
@@ -11,11 +9,11 @@ from PySide6.QtWidgets import QFileDialog
 
 class NativeFileDialog:
     """Drop-in replacement for QFileDialog.getSaveFileName/getOpenFileName.
-    On Linux with a working kdialog, uses it (same KIO widget Dolphin uses).
+    On Linux with a working kdialog, uses it (same KIO widget Dolphin uses —
+    an already-mounted network share behaves exactly like a local path here).
     Falls back to the plain Qt dialog if kdialog is missing or broken."""
 
     _kdialog_ok = None
-    _pending_remote_uploads: dict = {}  # temp local path -> real remote URL
 
     @staticmethod
     def _clean_env() -> dict:
@@ -56,10 +54,7 @@ class NativeFileDialog:
         except Exception as e:
             print(f"[NativeFileDialog] kdialog call failed: {e}")
             return None
-
         raw = result.stdout.strip()
-        print(f"[NativeFileDialog] kdialog raw output: {raw!r} (exit {result.returncode})")
-
         if result.returncode == 0 and raw:
             return raw
         if result.returncode == 1 and not result.stderr.strip():
@@ -68,60 +63,11 @@ class NativeFileDialog:
         return None
 
     @staticmethod
-    def _resolve_save_target(raw_url: str) -> str:
-        """Local file:// → ensure the parent directory exists (kdialog lets
-        you type a path that isn't there yet). Genuine remote URL (smb://,
-        sftp://...) → fitz can't write there directly, so stage a temp file
-        and remember the real destination for finish_remote_save()."""
-        parsed = urlparse(raw_url.strip())
-
+    def _url_to_path(raw: str) -> str:
+        parsed = urlparse(raw.strip())
         if parsed.scheme in ("", "file"):
-            local_path = unquote(parsed.path) if parsed.scheme == "file" else raw_url
-            parent = os.path.dirname(local_path)
-            if parent and not os.path.isdir(parent):
-                try:
-                    os.makedirs(parent, exist_ok=True)
-                except OSError as e:
-                    print(f"[NativeFileDialog] could not create {parent}: {e}")
-            return local_path
-
-        suffix = os.path.splitext(parsed.path)[1] or ".pdf"
-        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-        os.close(fd)
-        NativeFileDialog._pending_remote_uploads[tmp_path] = raw_url
-        print(f"[NativeFileDialog] remote destination ({raw_url}) — staging at {tmp_path}")
-        return tmp_path
-
-    @staticmethod
-    def finish_remote_save(local_path: str) -> bool:
-        """Call after successfully writing to the path get_save_file_name()
-        returned. No-op (True) unless that path was a staged remote upload."""
-        remote_url = NativeFileDialog._pending_remote_uploads.pop(local_path, None)
-        if remote_url is None:
-            return True
-
-        kioclient = (shutil.which("kioclient6") or shutil.which("kioclient5")
-                     or shutil.which("kioclient"))
-        if not kioclient:
-            print("[NativeFileDialog] no kioclient found — can't upload to remote location")
-            return False
-        try:
-            result = subprocess.run(
-                [kioclient, "copy", local_path, remote_url],
-                capture_output=True, text=True, env=NativeFileDialog._clean_env(),
-            )
-            if result.returncode != 0:
-                print(f"[NativeFileDialog] kioclient copy failed ({result.returncode}): {result.stderr.strip()}")
-                return False
-            return True
-        except Exception as e:
-            print(f"[NativeFileDialog] kioclient copy exception: {e}")
-            return False
-        finally:
-            try:
-                os.remove(local_path)
-            except OSError:
-                pass
+            return unquote(parsed.path) if parsed.scheme == "file" else raw
+        return raw  # genuinely unmounted resource — let it fail loudly
 
     @staticmethod
     def get_save_file_name(parent, caption: str, directory: str, filter: str):
@@ -130,7 +76,7 @@ class NativeFileDialog:
                 ["kdialog", "--title", caption, "--getsaveurl", directory, filter]
             )
             if raw is not None:
-                return (NativeFileDialog._resolve_save_target(raw), filter) if raw else ("", "")
+                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
         return QFileDialog.getSaveFileName(parent, caption, directory, filter)
 
     @staticmethod
@@ -140,8 +86,39 @@ class NativeFileDialog:
                 ["kdialog", "--title", caption, "--getopenurl", directory, filter]
             )
             if raw is not None:
-                if not raw:
-                    return "", ""
-                parsed = urlparse(raw)
-                return (unquote(parsed.path) if parsed.scheme == "file" else raw), filter
+                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
         return QFileDialog.getOpenFileName(parent, caption, directory, filter)
+
+
+ok = False
+if hasattr(pv, 'save_changes'):
+    ok = bool(pv.save_changes(file_path))
+elif hasattr(pv, 'save_document'):
+    ok = bool(pv.save_document(file_path))
+
+if ok:
+    # Without this, pv.doc_path never updates, so the next plain "Save"
+    # silently targets whatever was open before this Save As.
+    pv.close_document()
+    if not pv.open_document(file_path):
+        QMessageBox.critical(self.main_window, "Ошибка",
+                             "Файл сохранён, но не удалось переоткрыть документ.")
+        return False
+
+    if hasattr(self.ui, 'thumbnailList'):
+        try:
+            self.ui.thumbnailList.set_document(pv.document)
+        except Exception as e:
+            print(f"Thumbnail update failed: {e}")
+
+    self.main_window.current_document_path = file_path
+    if hasattr(self.main_window, 'setWindowTitle'):
+        filename = os.path.basename(file_path)
+        self.main_window.setWindowTitle(f"{APP_NAME} — {filename}")
+    self._mark_not_modified()
+    settings_manager.add_recent_file(file_path)
+    self.update_recent_files_menu()
+    return True
+
+QMessageBox.critical(self.main_window, "Ошибка при сохранении", "Не удалось сохранить документ.")
+return False
