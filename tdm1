@@ -1,124 +1,95 @@
-import os
-import shutil
-import subprocess
-import sys
-from urllib.parse import urlparse, unquote
+def open_file(self):
+    pv = getattr(self.ui, 'pdfView', None)
+    # Drawing mode: skip all dialogs, open in new instance
+    if pv and getattr(pv, 'drawing_mode', False):
+        last_dir = settings_manager.get_last_directory()
+        file_path, _ = NativeFileDialog.get_open_file_name(
+            self.main_window, "Open PDF", last_dir, "PDF Files (*.pdf)"
+        )
+        if not file_path:
+            return
+        settings_manager.save_last_directory(os.path.dirname(file_path))
+        settings_manager.add_recent_file(file_path)
+        self.update_recent_files_menu()
+        self._launch_new_instance(file_path)
+        return
 
-from PySide6.QtWidgets import QFileDialog
+    # Normal flow (drawing mode off)
+    if getattr(self.main_window, 'is_document_modified', False):
+        reply = self.main_window.ask_save_changes()
+        if reply == QMessageBox.Cancel:
+            return
+        if reply == QMessageBox.Save and not self.save_file():
+            return
 
+    last_dir = settings_manager.get_last_directory()
+    file_path, _ = NativeFileDialog.get_open_file_name(
+        self.main_window, "Open PDF", last_dir, "PDF Files (*.pdf)"
+    )
+    if not file_path:
+        return
 
-class NativeFileDialog:
-    """Drop-in replacement for QFileDialog.getSaveFileName/getOpenFileName.
-    On Linux with a working kdialog, uses it (same KIO widget Dolphin uses —
-    an already-mounted network share behaves exactly like a local path here).
-    Falls back to the plain Qt dialog if kdialog is missing or broken."""
-
-    _kdialog_ok = None
-
-    @staticmethod
-    def _clean_env() -> dict:
-        env = os.environ.copy()
-        if sys.platform.startswith("linux"):
-            if 'LD_LIBRARY_PATH_ORIG' in env:
-                env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
-            else:
-                env.pop('LD_LIBRARY_PATH', None)
-        return env
-
-    @staticmethod
-    def _kdialog_available() -> bool:
-        if not sys.platform.startswith("linux"):
-            return False
-        if NativeFileDialog._kdialog_ok is not None:
-            return NativeFileDialog._kdialog_ok
-        if shutil.which("kdialog") is None:
-            NativeFileDialog._kdialog_ok = False
-            return False
-        try:
-            result = subprocess.run(
-                ["kdialog", "--version"], capture_output=True, text=True,
-                timeout=5, env=NativeFileDialog._clean_env(),
-            )
-            NativeFileDialog._kdialog_ok = (result.returncode == 0)
-        except Exception as e:
-            print(f"[NativeFileDialog] kdialog self-test failed: {e}")
-            NativeFileDialog._kdialog_ok = False
-        return NativeFileDialog._kdialog_ok
-
-    @staticmethod
-    def _run_kdialog(args: list):
-        try:
-            result = subprocess.run(
-                args, capture_output=True, text=True, env=NativeFileDialog._clean_env(),
-            )
-        except Exception as e:
-            print(f"[NativeFileDialog] kdialog call failed: {e}")
-            return None
-        raw = result.stdout.strip()
-        if result.returncode == 0 and raw:
-            return raw
-        if result.returncode == 1 and not result.stderr.strip():
-            return ""  # normal cancel
-        print(f"[NativeFileDialog] kdialog exit {result.returncode}: {result.stderr.strip()}")
-        return None
-
-    @staticmethod
-    def _url_to_path(raw: str) -> str:
-        parsed = urlparse(raw.strip())
-        if parsed.scheme in ("", "file"):
-            return unquote(parsed.path) if parsed.scheme == "file" else raw
-        return raw  # genuinely unmounted resource — let it fail loudly
-
-    @staticmethod
-    def get_save_file_name(parent, caption: str, directory: str, filter: str):
-        if NativeFileDialog._kdialog_available():
-            raw = NativeFileDialog._run_kdialog(
-                ["kdialog", "--title", caption, "--getsaveurl", directory, filter]
-            )
-            if raw is not None:
-                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
-        return QFileDialog.getSaveFileName(parent, caption, directory, filter)
-
-    @staticmethod
-    def get_open_file_name(parent, caption: str, directory: str, filter: str):
-        if NativeFileDialog._kdialog_available():
-            raw = NativeFileDialog._run_kdialog(
-                ["kdialog", "--title", caption, "--getopenurl", directory, filter]
-            )
-            if raw is not None:
-                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
-        return QFileDialog.getOpenFileName(parent, caption, directory, filter)
-
-
-ok = False
-if hasattr(pv, 'save_changes'):
-    ok = bool(pv.save_changes(file_path))
-elif hasattr(pv, 'save_document'):
-    ok = bool(pv.save_document(file_path))
-
-if ok:
-    # Without this, pv.doc_path never updates, so the next plain "Save"
-    # silently targets whatever was open before this Save As.
-    pv.close_document()
-    if not pv.open_document(file_path):
-        QMessageBox.critical(self.main_window, "Ошибка",
-                             "Файл сохранён, но не удалось переоткрыть документ.")
-        return False
-
-    if hasattr(self.ui, 'thumbnailList'):
-        try:
-            self.ui.thumbnailList.set_document(pv.document)
-        except Exception as e:
-            print(f"Thumbnail update failed: {e}")
-
-    self.main_window.current_document_path = file_path
-    if hasattr(self.main_window, 'setWindowTitle'):
-        filename = os.path.basename(file_path)
-        self.main_window.setWindowTitle(f"{APP_NAME} — {filename}")
-    self._mark_not_modified()
+    settings_manager.save_last_directory(os.path.dirname(file_path))
     settings_manager.add_recent_file(file_path)
     self.update_recent_files_menu()
-    return True
 
-QMessageBox.critical(self.main_window, "Ошибка при сохранении", "Не удалось сохранить документ.")
-return False
+    pv = getattr(self.ui, 'pdfView', None)
+    has_open_doc = bool(pv and hasattr(pv, 'document') and pv.document is not None)
+    if not has_open_doc:
+        self.main_window.load_document(file_path)
+        return
+
+    choice = self._ask_open_window_choice()
+    if choice == "same":
+        self.main_window.load_document(file_path)
+    elif choice == "new":
+        self._launch_new_instance(file_path)
+
+
+
+
+
+@staticmethod
+def resolve_dropped_url(url) -> str:
+    """Resolve a QUrl from a drag-and-drop event into a path fitz can open."""
+    if url.isLocalFile():
+        return url.toLocalFile()
+    print(f"[NativeFileDialog] dropped URL isn't a local file: {url.toString()}")
+    return ""
+
+
+
+
+
+@staticmethod
+def _url_is_pdf(url) -> bool:
+    """toLocalFile() is empty for non-file:// URLs, so fall back to path()
+    for the extension check — works for both local and remote URLs."""
+    path = url.toLocalFile() or url.path()
+    return path.lower().endswith('.pdf')
+
+def dragEnterEvent(self, event: QDragEnterEvent):
+    urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+    if urls and self._url_is_pdf(urls[0]):
+        event.accept()
+    else:
+        event.ignore()
+
+def dropEvent(self, event: QDropEvent):
+    urls = event.mimeData().urls()
+    if not urls or not self._url_is_pdf(urls[0]):
+        return
+
+    file_path = NativeFileDialog.resolve_dropped_url(urls[0])
+    if not file_path:
+        QMessageBox.warning(
+            self, "Не удалось открыть файл",
+            "Не удалось получить доступ к перетащенному файлу.\nПопробуйте Файл → Открыть."
+        )
+        return
+
+    if self.ui.pdfView.drawing_mode:
+        self.actions_handler._launch_new_instance(file_path)
+        return
+    self.load_document(file_path)
+
