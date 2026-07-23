@@ -1,95 +1,127 @@
-def open_file(self):
-    pv = getattr(self.ui, 'pdfView', None)
-    # Drawing mode: skip all dialogs, open in new instance
-    if pv and getattr(pv, 'drawing_mode', False):
-        last_dir = settings_manager.get_last_directory()
-        file_path, _ = NativeFileDialog.get_open_file_name(
-            self.main_window, "Open PDF", last_dir, "PDF Files (*.pdf)"
+from dataclasses import dataclass
+import fitz  # PyMuPDF
+from fitz import Page
+
+
+@dataclass
+class PageInfo:
+    """Information about a PDF page"""
+    page_num: int
+    width: float
+    height: float
+    rotation: int = 0
+
+
+class Document:
+    def __init__(self, file_path: str = None):
+        self.file_path = file_path
+        self.current_doc = None
+        try:
+            self.current_doc = fitz.open(file_path)
+        except Exception as e:
+            print(f"Error open document: {e}")
+
+    def auth(self, password: str):
+        if not self.current_doc:
+            return
+        if not self.current_doc.authenticate(password):
+            self.close()
+
+    def get_page_count(self) -> int:
+        return self.current_doc.page_count if self.current_doc else 0
+
+    def get_page(self, num: int):
+        if not self.current_doc:
+            return None
+        try:
+            return self.current_doc.load_page(num)
+        except Exception as e:
+            print(f"Error get page: {e}")
+
+    def get_page_info(self, num_page: int) -> PageInfo:
+        w, h = self.get_page_size(num_page)
+        return PageInfo(
+            page_num=num_page, width=w, height=h,
+            rotation=self.current_doc[num_page].rotation
         )
-        if not file_path:
-            return
-        settings_manager.save_last_directory(os.path.dirname(file_path))
-        settings_manager.add_recent_file(file_path)
-        self.update_recent_files_menu()
-        self._launch_new_instance(file_path)
-        return
 
-    # Normal flow (drawing mode off)
-    if getattr(self.main_window, 'is_document_modified', False):
-        reply = self.main_window.ask_save_changes()
-        if reply == QMessageBox.Cancel:
-            return
-        if reply == QMessageBox.Save and not self.save_file():
-            return
+    def get_page_size(self, num_page: int) -> tuple:
+        if not self.current_doc or not 0 <= num_page < self.current_doc.page_count:
+            raise IndexError(f'Page number {num_page} is out of range')
+        rect = self.current_doc[num_page].rect
+        return rect.width, rect.height
 
-    last_dir = settings_manager.get_last_directory()
-    file_path, _ = NativeFileDialog.get_open_file_name(
-        self.main_window, "Open PDF", last_dir, "PDF Files (*.pdf)"
-    )
-    if not file_path:
-        return
+    def need_auth(self) -> bool:
+        return bool(self.current_doc and self.current_doc.needs_pass)
 
-    settings_manager.save_last_directory(os.path.dirname(file_path))
-    settings_manager.add_recent_file(file_path)
-    self.update_recent_files_menu()
+    def new_page(self, in_width: float, in_height: float) -> Page:
+        if self.current_doc:
+            return self.current_doc.new_page(width=in_width, height=in_height)
 
-    pv = getattr(self.ui, 'pdfView', None)
-    has_open_doc = bool(pv and hasattr(pv, 'document') and pv.document is not None)
-    if not has_open_doc:
-        self.main_window.load_document(file_path)
-        return
+    def move_page(self, pno: int, to: int):
+        if self.current_doc:
+            self.current_doc.move_page(pno, to)
 
-    choice = self._ask_open_window_choice()
-    if choice == "same":
-        self.main_window.load_document(file_path)
-    elif choice == "new":
-        self._launch_new_instance(file_path)
+    def delete_page(self, pno: int):
+        if self.current_doc:
+            self.current_doc.delete_page(pno)
+
+    def save(self, file_path: str, save_to_self: bool = True):
+        if self.current_doc:
+            self.current_doc.save(file_path, incremental=save_to_self, encryption=fitz.PDF_ENCRYPT_KEEP)
+
+    def close(self):
+        if self.current_doc:
+            self.current_doc.close()
 
 
 
+self.close_document()
+self.document = Document(file_path)
 
+if self.document.current_doc is None:
+    raise RuntimeError(f"Не удалось открыть файл: {file_path}")
 
-@staticmethod
-def resolve_dropped_url(url) -> str:
-    """Resolve a QUrl from a drag-and-drop event into a path fitz can open."""
-    if url.isLocalFile():
-        return url.toLocalFile()
-    print(f"[NativeFileDialog] dropped URL isn't a local file: {url.toString()}")
-    return ""
+self.zoom_level = 1.0
+password = self.authenticate_document()
 
 
 
 
 
-@staticmethod
-def _url_is_pdf(url) -> bool:
-    """toLocalFile() is empty for non-file:// URLs, so fall back to path()
-    for the extension check — works for both local and remote URLs."""
-    path = url.toLocalFile() or url.path()
-    return path.lower().endswith('.pdf')
-
-def dragEnterEvent(self, event: QDragEnterEvent):
-    urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
-    if urls and self._url_is_pdf(urls[0]):
-        event.accept()
+if not success:
+    if os.path.isfile(file_path):
+        print("Document loading failed, checking if encrypted")
+        success = self.handle_encrypted_document(file_path)
     else:
-        event.ignore()
+        print(f"Document loading failed, path is not a reachable local file: {file_path}")
 
-def dropEvent(self, event: QDropEvent):
-    urls = event.mimeData().urls()
-    if not urls or not self._url_is_pdf(urls[0]):
-        return
 
-    file_path = NativeFileDialog.resolve_dropped_url(urls[0])
-    if not file_path:
-        QMessageBox.warning(
+
+
+
+else:
+    print(f"Failed to load document: {file_path}")
+    if file_path.startswith(("smb://", "sftp://", "ftp://", "webdav://", "davs://")):
+        QMessageBox.critical(
             self, "Не удалось открыть файл",
-            "Не удалось получить доступ к перетащенному файлу.\nПопробуйте Файл → Открыть."
+            f"Не удалось напрямую открыть файл по сетевому пути:\n{file_path}\n\n"
+            "Подключите сетевой ресурс через файловый менеджер "
+            "(Диспетчер файлов → Сеть → Подключиться к серверу), "
+            "после чего он будет доступен как обычная папка."
         )
-        return
+    else:
+        QMessageBox.critical(self, "Error", f"Failed to open PDF file: {file_path}")
 
-    if self.ui.pdfView.drawing_mode:
-        self.actions_handler._launch_new_instance(file_path)
-        return
-    self.load_document(file_path)
 
+
+
+if not file_path:
+    QMessageBox.warning(
+        self, "Не удалось открыть файл",
+        "Не удалось напрямую открыть перетащенный файл с сетевого ресурса.\n\n"
+        "Подключите сетевой ресурс через файловый менеджер "
+        "(Диспетчер файлов → Сеть → Подключиться к серверу), "
+        "после чего перетаскивание будет работать как обычно."
+    )
+    return
