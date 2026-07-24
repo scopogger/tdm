@@ -1,146 +1,76 @@
-import os
-import re
-import shutil
-import subprocess
-import sys
-from urllib.parse import urlparse, unquote
+# add near the top of the class, alongside _kdialog_ok
+_kiofuse_mounted_paths: set = set()
 
-from PySide6.QtWidgets import QFileDialog
+# inside _mount_via_kiofuse, right before the final print+return:
+mounted_path = match.group(1)
+NativeFileDialog._kiofuse_mounted_paths.add(mounted_path)
+print(f"[NativeFileDialog] kio-fuse mounted {url} -> {mounted_path}")
+return mounted_path
 
 
-class NativeFileDialog:
-    """Drop-in replacement for QFileDialog.getSaveFileName/getOpenFileName.
-    On Linux with a working kdialog, uses it (same KIO widget Dolphin uses).
-    Remote picks (smb://, sftp://...) get resolved to a real local path via
-    KDE's kio-fuse daemon. Falls back to the plain Qt dialog if kdialog is
-    missing or broken."""
 
-    _kdialog_ok = None
 
-    @staticmethod
-    def _clean_env() -> dict:
-        env = os.environ.copy()
-        if sys.platform.startswith("linux"):
-            if 'LD_LIBRARY_PATH_ORIG' in env:
-                env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
-            else:
-                env.pop('LD_LIBRARY_PATH', None)
-        return env
 
-    @staticmethod
-    def _kdialog_available() -> bool:
-        if not sys.platform.startswith("linux"):
+@staticmethod
+def is_remote_mount(path: str) -> bool:
+    """True if *path* was resolved from a remote KIO URL via kio-fuse,
+    as opposed to a path the user picked directly on local disk."""
+    return path in NativeFileDialog._kiofuse_mounted_paths
+
+@staticmethod
+def buffered_save(save_fn, target_path: str) -> bool:
+    """Write via save_fn(tmp_path) to a fast local temp file, then bulk-copy
+    the result to target_path in one shot. Only valid for a full/non-
+    incremental save — there's nothing to incrementally append onto in an
+    empty temp file."""
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(target_path)[1] or ".pdf")
+    os.close(fd)
+    try:
+        if not save_fn(tmp_path):
             return False
-        if NativeFileDialog._kdialog_ok is not None:
-            return NativeFileDialog._kdialog_ok
-        if shutil.which("kdialog") is None:
-            NativeFileDialog._kdialog_ok = False
-            return False
+        shutil.copyfile(tmp_path, target_path)
+        return True
+    except Exception as e:
+        print(f"[NativeFileDialog] buffered save to {target_path} failed: {e}")
+        return False
+    finally:
         try:
-            result = subprocess.run(
-                ["kdialog", "--version"], capture_output=True, text=True,
-                timeout=5, env=NativeFileDialog._clean_env(),
-            )
-            NativeFileDialog._kdialog_ok = (result.returncode == 0)
-        except Exception as e:
-            print(f"[NativeFileDialog] kdialog self-test failed: {e}")
-            NativeFileDialog._kdialog_ok = False
-        return NativeFileDialog._kdialog_ok
-
-    @staticmethod
-    def _run_kdialog(args: list):
-        try:
-            result = subprocess.run(
-                args, capture_output=True, text=True, env=NativeFileDialog._clean_env(),
-            )
-        except Exception as e:
-            print(f"[NativeFileDialog] kdialog call failed: {e}")
-            return None
-        raw = result.stdout.strip()
-        if result.returncode == 0 and raw:
-            return raw
-        if result.returncode == 1 and not result.stderr.strip():
-            return ""  # normal cancel
-        print(f"[NativeFileDialog] kdialog exit {result.returncode}: {result.stderr.strip()}")
-        return None
-
-    @staticmethod
-    def _mount_via_kiofuse(url: str, timeout: float = 30.0) -> str:
-        """Ask KDE's kio-fuse daemon to mount *url* and hand back a real
-        local path. Returns "" if kio-fuse isn't running, the server is
-        unreachable, or credentials couldn't be resolved."""
-        if not sys.platform.startswith("linux") or shutil.which("dbus-send") is None:
-            return ""
-        try:
-            result = subprocess.run(
-                ["dbus-send", "--session", "--print-reply", "--type=method_call",
-                 "--dest=org.kde.KIOFuse", "/org/kde/KIOFuse",
-                 "org.kde.KIOFuse.VFS.mountUrl", f"string:{url}"],
-                capture_output=True, text=True, timeout=timeout,
-                env=NativeFileDialog._clean_env(),
-            )
-        except subprocess.TimeoutExpired:
-            print(f"[NativeFileDialog] kio-fuse mount timed out for {url} "
-                  f"(possibly waiting on a credentials prompt or unreachable server)")
-            return ""
-        except Exception as e:
-            print(f"[NativeFileDialog] kio-fuse mount call failed: {e}")
-            return ""
-
-        if result.returncode != 0:
-            print(f"[NativeFileDialog] kio-fuse mount failed for {url}: {result.stderr.strip()}")
-            return ""
-
-        match = re.search(r'string "((?:[^"\\]|\\.)*)"', result.stdout)
-        if not match:
-            print(f"[NativeFileDialog] kio-fuse gave no path for {url}: {result.stdout.strip()}")
-            return ""
-
-        mounted_path = match.group(1)
-        print(f"[NativeFileDialog] kio-fuse mounted {url} -> {mounted_path}")
-        return mounted_path
-
-    @staticmethod
-    def _url_to_path(raw: str) -> str:
-        parsed = urlparse(raw.strip())
-        if parsed.scheme in ("", "file"):
-            return unquote(parsed.path) if parsed.scheme == "file" else raw
-        mounted = NativeFileDialog._mount_via_kiofuse(raw.strip())
-        return mounted or raw  # unresolved URL falls through to the existing error message
-
-    @staticmethod
-    def resolve_dropped_url(url) -> str:
-        """Resolve a QUrl from a drag-and-drop event into a path fitz can open."""
-        if url.isLocalFile():
-            return url.toLocalFile()
-        remote = url.toString()
-        print(f"[NativeFileDialog] dropped URL isn't local, trying kio-fuse: {remote}")
-        return NativeFileDialog._mount_via_kiofuse(remote)
-
-    @staticmethod
-    def get_save_file_name(parent, caption: str, directory: str, filter: str):
-        if NativeFileDialog._kdialog_available():
-            raw = NativeFileDialog._run_kdialog(
-                ["kdialog", "--title", caption, "--getsaveurl", directory, filter]
-            )
-            if raw is not None:
-                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
-        return QFileDialog.getSaveFileName(parent, caption, directory, filter)
-
-    @staticmethod
-    def get_open_file_name(parent, caption: str, directory: str, filter: str):
-        if NativeFileDialog._kdialog_available():
-            raw = NativeFileDialog._run_kdialog(
-                ["kdialog", "--title", caption, "--getopenurl", directory, filter]
-            )
-            if raw is not None:
-                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
-        return QFileDialog.getOpenFileName(parent, caption, directory, filter)
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 
 
 
-except Exception as e:
-    print(f"Error opening document: {e}")
-    return False
+def save_changes(self, file_path: str = None) -> bool:
+    """Save changes to file..."""
+    if not self.document:
+        return True
+    try:
+        if file_path:
+            save_path = file_path
+        elif hasattr(self, '_original_doc_path') and self._original_doc_path:
+            save_path = self._original_doc_path
+        else:
+            save_path = self.doc_path
+
+        is_incremental = (save_path == self.doc_path)
+
+        def _do_save(path: str) -> bool:
+            try:
+                self.document.save(path, is_incremental)
+                return True
+            except Exception as e:
+                print(f"ERROR {e}")
+                return False
+
+        if not is_incremental and NativeFileDialog.is_remote_mount(save_path):
+            return NativeFileDialog.buffered_save(_do_save, save_path)
+
+        return _do_save(save_path)
+
+    except Exception as e:
+        QMessageBox.critical(None, "Save Error", f"Failed to save PDF: {e}")
+        return False
