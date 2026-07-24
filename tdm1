@@ -11,6 +11,7 @@ return mounted_path
 
 
 
+
 @staticmethod
 def is_remote_mount(path: str) -> bool:
     """True if *path* was resolved from a remote KIO URL via kio-fuse,
@@ -39,6 +40,8 @@ def buffered_save(save_fn, target_path: str) -> bool:
             os.remove(tmp_path)
         except OSError:
             pass
+
+
 
 
 
@@ -74,3 +77,12 @@ def save_changes(self, file_path: str = None) -> bool:
     except Exception as e:
         QMessageBox.critical(None, "Save Error", f"Failed to save PDF: {e}")
         return False
+
+
+
+
+
+kdialog --version
+apt-cache policy kde-cli-tools kio-fuse
+find /usr/share/dbus-1/services /usr/share/dbus-1/system-services -iname "*kiofuse*" 2>/dev/null
+dbus-send --session --print-reply --type=method_call --dest=org.kde.KIOFuse /org/kde/KIOFuse org.kde.KIOFuse.VFS.mountUrl "string:file:///tmp"
