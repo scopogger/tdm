@@ -1,127 +1,146 @@
-from dataclasses import dataclass
-import fitz  # PyMuPDF
-from fitz import Page
+import os
+import re
+import shutil
+import subprocess
+import sys
+from urllib.parse import urlparse, unquote
+
+from PySide6.QtWidgets import QFileDialog
 
 
-@dataclass
-class PageInfo:
-    """Information about a PDF page"""
-    page_num: int
-    width: float
-    height: float
-    rotation: int = 0
+class NativeFileDialog:
+    """Drop-in replacement for QFileDialog.getSaveFileName/getOpenFileName.
+    On Linux with a working kdialog, uses it (same KIO widget Dolphin uses).
+    Remote picks (smb://, sftp://...) get resolved to a real local path via
+    KDE's kio-fuse daemon. Falls back to the plain Qt dialog if kdialog is
+    missing or broken."""
 
+    _kdialog_ok = None
 
-class Document:
-    def __init__(self, file_path: str = None):
-        self.file_path = file_path
-        self.current_doc = None
+    @staticmethod
+    def _clean_env() -> dict:
+        env = os.environ.copy()
+        if sys.platform.startswith("linux"):
+            if 'LD_LIBRARY_PATH_ORIG' in env:
+                env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
+            else:
+                env.pop('LD_LIBRARY_PATH', None)
+        return env
+
+    @staticmethod
+    def _kdialog_available() -> bool:
+        if not sys.platform.startswith("linux"):
+            return False
+        if NativeFileDialog._kdialog_ok is not None:
+            return NativeFileDialog._kdialog_ok
+        if shutil.which("kdialog") is None:
+            NativeFileDialog._kdialog_ok = False
+            return False
         try:
-            self.current_doc = fitz.open(file_path)
+            result = subprocess.run(
+                ["kdialog", "--version"], capture_output=True, text=True,
+                timeout=5, env=NativeFileDialog._clean_env(),
+            )
+            NativeFileDialog._kdialog_ok = (result.returncode == 0)
         except Exception as e:
-            print(f"Error open document: {e}")
+            print(f"[NativeFileDialog] kdialog self-test failed: {e}")
+            NativeFileDialog._kdialog_ok = False
+        return NativeFileDialog._kdialog_ok
 
-    def auth(self, password: str):
-        if not self.current_doc:
-            return
-        if not self.current_doc.authenticate(password):
-            self.close()
-
-    def get_page_count(self) -> int:
-        return self.current_doc.page_count if self.current_doc else 0
-
-    def get_page(self, num: int):
-        if not self.current_doc:
+    @staticmethod
+    def _run_kdialog(args: list):
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True, env=NativeFileDialog._clean_env(),
+            )
+        except Exception as e:
+            print(f"[NativeFileDialog] kdialog call failed: {e}")
             return None
+        raw = result.stdout.strip()
+        if result.returncode == 0 and raw:
+            return raw
+        if result.returncode == 1 and not result.stderr.strip():
+            return ""  # normal cancel
+        print(f"[NativeFileDialog] kdialog exit {result.returncode}: {result.stderr.strip()}")
+        return None
+
+    @staticmethod
+    def _mount_via_kiofuse(url: str, timeout: float = 30.0) -> str:
+        """Ask KDE's kio-fuse daemon to mount *url* and hand back a real
+        local path. Returns "" if kio-fuse isn't running, the server is
+        unreachable, or credentials couldn't be resolved."""
+        if not sys.platform.startswith("linux") or shutil.which("dbus-send") is None:
+            return ""
         try:
-            return self.current_doc.load_page(num)
+            result = subprocess.run(
+                ["dbus-send", "--session", "--print-reply", "--type=method_call",
+                 "--dest=org.kde.KIOFuse", "/org/kde/KIOFuse",
+                 "org.kde.KIOFuse.VFS.mountUrl", f"string:{url}"],
+                capture_output=True, text=True, timeout=timeout,
+                env=NativeFileDialog._clean_env(),
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[NativeFileDialog] kio-fuse mount timed out for {url} "
+                  f"(possibly waiting on a credentials prompt or unreachable server)")
+            return ""
         except Exception as e:
-            print(f"Error get page: {e}")
+            print(f"[NativeFileDialog] kio-fuse mount call failed: {e}")
+            return ""
 
-    def get_page_info(self, num_page: int) -> PageInfo:
-        w, h = self.get_page_size(num_page)
-        return PageInfo(
-            page_num=num_page, width=w, height=h,
-            rotation=self.current_doc[num_page].rotation
-        )
+        if result.returncode != 0:
+            print(f"[NativeFileDialog] kio-fuse mount failed for {url}: {result.stderr.strip()}")
+            return ""
 
-    def get_page_size(self, num_page: int) -> tuple:
-        if not self.current_doc or not 0 <= num_page < self.current_doc.page_count:
-            raise IndexError(f'Page number {num_page} is out of range')
-        rect = self.current_doc[num_page].rect
-        return rect.width, rect.height
+        match = re.search(r'string "((?:[^"\\]|\\.)*)"', result.stdout)
+        if not match:
+            print(f"[NativeFileDialog] kio-fuse gave no path for {url}: {result.stdout.strip()}")
+            return ""
 
-    def need_auth(self) -> bool:
-        return bool(self.current_doc and self.current_doc.needs_pass)
+        mounted_path = match.group(1)
+        print(f"[NativeFileDialog] kio-fuse mounted {url} -> {mounted_path}")
+        return mounted_path
 
-    def new_page(self, in_width: float, in_height: float) -> Page:
-        if self.current_doc:
-            return self.current_doc.new_page(width=in_width, height=in_height)
+    @staticmethod
+    def _url_to_path(raw: str) -> str:
+        parsed = urlparse(raw.strip())
+        if parsed.scheme in ("", "file"):
+            return unquote(parsed.path) if parsed.scheme == "file" else raw
+        mounted = NativeFileDialog._mount_via_kiofuse(raw.strip())
+        return mounted or raw  # unresolved URL falls through to the existing error message
 
-    def move_page(self, pno: int, to: int):
-        if self.current_doc:
-            self.current_doc.move_page(pno, to)
+    @staticmethod
+    def resolve_dropped_url(url) -> str:
+        """Resolve a QUrl from a drag-and-drop event into a path fitz can open."""
+        if url.isLocalFile():
+            return url.toLocalFile()
+        remote = url.toString()
+        print(f"[NativeFileDialog] dropped URL isn't local, trying kio-fuse: {remote}")
+        return NativeFileDialog._mount_via_kiofuse(remote)
 
-    def delete_page(self, pno: int):
-        if self.current_doc:
-            self.current_doc.delete_page(pno)
+    @staticmethod
+    def get_save_file_name(parent, caption: str, directory: str, filter: str):
+        if NativeFileDialog._kdialog_available():
+            raw = NativeFileDialog._run_kdialog(
+                ["kdialog", "--title", caption, "--getsaveurl", directory, filter]
+            )
+            if raw is not None:
+                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
+        return QFileDialog.getSaveFileName(parent, caption, directory, filter)
 
-    def save(self, file_path: str, save_to_self: bool = True):
-        if self.current_doc:
-            self.current_doc.save(file_path, incremental=save_to_self, encryption=fitz.PDF_ENCRYPT_KEEP)
-
-    def close(self):
-        if self.current_doc:
-            self.current_doc.close()
-
-
-
-self.close_document()
-self.document = Document(file_path)
-
-if self.document.current_doc is None:
-    raise RuntimeError(f"Не удалось открыть файл: {file_path}")
-
-self.zoom_level = 1.0
-password = self.authenticate_document()
-
-
-
-
-
-if not success:
-    if os.path.isfile(file_path):
-        print("Document loading failed, checking if encrypted")
-        success = self.handle_encrypted_document(file_path)
-    else:
-        print(f"Document loading failed, path is not a reachable local file: {file_path}")
+    @staticmethod
+    def get_open_file_name(parent, caption: str, directory: str, filter: str):
+        if NativeFileDialog._kdialog_available():
+            raw = NativeFileDialog._run_kdialog(
+                ["kdialog", "--title", caption, "--getopenurl", directory, filter]
+            )
+            if raw is not None:
+                return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
+        return QFileDialog.getOpenFileName(parent, caption, directory, filter)
 
 
 
 
 
-else:
-    print(f"Failed to load document: {file_path}")
-    if file_path.startswith(("smb://", "sftp://", "ftp://", "webdav://", "davs://")):
-        QMessageBox.critical(
-            self, "Не удалось открыть файл",
-            f"Не удалось напрямую открыть файл по сетевому пути:\n{file_path}\n\n"
-            "Подключите сетевой ресурс через файловый менеджер "
-            "(Диспетчер файлов → Сеть → Подключиться к серверу), "
-            "после чего он будет доступен как обычная папка."
-        )
-    else:
-        QMessageBox.critical(self, "Error", f"Failed to open PDF file: {file_path}")
-
-
-
-
-if not file_path:
-    QMessageBox.warning(
-        self, "Не удалось открыть файл",
-        "Не удалось напрямую открыть перетащенный файл с сетевого ресурса.\n\n"
-        "Подключите сетевой ресурс через файловый менеджер "
-        "(Диспетчер файлов → Сеть → Подключиться к серверу), "
-        "после чего перетаскивание будет работать как обычно."
-    )
-    return
+except Exception as e:
+    print(f"Error opening document: {e}")
+    return False
