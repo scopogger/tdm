@@ -1,36 +1,27 @@
-# add near the top of the class, alongside _kdialog_ok
-_kiofuse_mounted_paths: set = set()
-
-# inside _mount_via_kiofuse, right before the final print+return:
-mounted_path = match.group(1)
-NativeFileDialog._kiofuse_mounted_paths.add(mounted_path)
-print(f"[NativeFileDialog] kio-fuse mounted {url} -> {mounted_path}")
-return mounted_path
-
-
-
-
-
-
 @staticmethod
 def is_remote_mount(path: str) -> bool:
-    """True if *path* was resolved from a remote KIO URL via kio-fuse,
-    as opposed to a path the user picked directly on local disk."""
-    return path in NativeFileDialog._kiofuse_mounted_paths
+    """True if *path* is a kio-fuse-mounted remote resource."""
+    if path in NativeFileDialog._kiofuse_mounted_paths:
+        return True
+    return "/kio-fuse-" in path
+
+
 
 @staticmethod
 def buffered_save(save_fn, target_path: str) -> bool:
-    """Write via save_fn(tmp_path) to a fast local temp file, then bulk-copy
-    the result to target_path in one shot. Only valid for a full/non-
-    incremental save — there's nothing to incrementally append onto in an
-    empty temp file."""
-    import tempfile
+    import tempfile, time
     fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(target_path)[1] or ".pdf")
     os.close(fd)
     try:
+        print(f"[NativeFileDialog] buffered_save: writing locally, then copying to {target_path}")
+        t0 = time.time()
         if not save_fn(tmp_path):
             return False
+        t1 = time.time()
         shutil.copyfile(tmp_path, target_path)
+        t2 = time.time()
+        size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+        print(f"[NativeFileDialog] buffered_save: {size_mb:.1f}MB — local write {t1-t0:.1f}s, copy to destination {t2-t1:.1f}s")
         return True
     except Exception as e:
         print(f"[NativeFileDialog] buffered save to {target_path} failed: {e}")
@@ -44,11 +35,7 @@ def buffered_save(save_fn, target_path: str) -> bool:
 
 
 
-
-
-
 def save_changes(self, file_path: str = None) -> bool:
-    """Save changes to file..."""
     if not self.document:
         return True
     try:
@@ -73,16 +60,7 @@ def save_changes(self, file_path: str = None) -> bool:
             return NativeFileDialog.buffered_save(_do_save, save_path)
 
         return _do_save(save_path)
-
     except Exception as e:
         QMessageBox.critical(None, "Save Error", f"Failed to save PDF: {e}")
         return False
 
-
-
-
-
-kdialog --version
-apt-cache policy kde-cli-tools kio-fuse
-find /usr/share/dbus-1/services /usr/share/dbus-1/system-services -iname "*kiofuse*" 2>/dev/null
-dbus-send --session --print-reply --type=method_call --dest=org.kde.KIOFuse /org/kde/KIOFuse org.kde.KIOFuse.VFS.mountUrl "string:file:///tmp"
