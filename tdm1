@@ -1,209 +1,46 @@
-import os
-import re
-import shutil
-import subprocess
-import sys
-import time
-from urllib.parse import urlparse, unquote
-
-from PySide6.QtWidgets import QFileDialog
 
 
-class NativeFileDialog:
-    _kdialog_ok = None
-    _kiofuse_mounted_paths: dict = {}  # local mounted path -> original KIO URL
+**What was actually wrong originally:** the merge built a temp file, then pointed `doc_path` *at that temp file* — so "Save" was technically working correctly, just saving to a throwaway path nobody would ever look at again. My fix then made it write directly to the real file immediately, which fixes persistence but breaks discard/undo entirely — exactly what you're now seeing.
 
-    @staticmethod
-    def _clean_env() -> dict:
-        env = os.environ.copy()
-        if sys.platform.startswith("linux"):
-            if 'LD_LIBRARY_PATH_ORIG' in env:
-                env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
-            else:
-                env.pop('LD_LIBRARY_PATH', None)
-        return env
+**The right fix:** stop treating merge as "build a separate document, then juggle paths." Insert directly into the *currently open* document in memory — same as rotate/delete/move page already do — so it becomes a normal pending change: Save persists it, Save As persists it elsewhere, closing without saving discards it cleanly, no path ever gets touched until the user actually asks.
 
-    @staticmethod
-    def _kdialog_available() -> bool:
-        if not sys.platform.startswith("linux"):
-            return False
-        if NativeFileDialog._kdialog_ok is True:
-            return True
-        if shutil.which("kdialog") is None:
-            print("[NativeFileDialog] kdialog not found on PATH")
-            NativeFileDialog._kdialog_ok = False
-            return False
-        try:
-            result = subprocess.run(
-                ["kdialog", "--version"], capture_output=True, text=True,
-                timeout=5, env=NativeFileDialog._clean_env(),
-            )
-            NativeFileDialog._kdialog_ok = (result.returncode == 0)
-            if not NativeFileDialog._kdialog_ok:
-                print(f"[NativeFileDialog] kdialog self-test exit {result.returncode}: "
-                      f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}")
-        except Exception as e:
-            print(f"[NativeFileDialog] kdialog self-test failed: {e}")
-            NativeFileDialog._kdialog_ok = False
-        return NativeFileDialog._kdialog_ok
+**`document.py`** — add one method, same style as `move_page`/`delete_page`:
+```python
+def insert_pdf(self, other_doc, start_at: int = -1):
+    if self.current_doc:
+        self.current_doc.insert_pdf(other_doc, start_at=start_at)
+```
 
-    @staticmethod
-    def _run_kdialog(args: list) -> str:
-        try:
-            result = subprocess.run(
-                args, capture_output=True, text=True, env=NativeFileDialog._clean_env(),
-            )
-        except Exception as e:
-            print(f"[NativeFileDialog] kdialog call failed: {e}")
-            return ""
-        raw = result.stdout.strip()
-        if raw:
-            return raw
-        if result.stderr.strip():
-            print(f"[NativeFileDialog] kdialog exit {result.returncode}, no selection. "
-                  f"stderr: {result.stderr.strip()}")
-        return ""
+**`pdf_viewer.py`** — add `insert_document`, mirroring `delete_pages_by_range`'s pattern exactly (mutate, then `reinitializePageWidgets` / `doc_changing` / `refresh_render`):
+```python
+def insert_document(self, new_doc, insert_before: bool, insert_at_page: int) -> bool:
+    """Insert another fitz.Document's pages into the currently open document,
+    in-memory — pending, exactly like rotate/delete/move page, until Save/Save As."""
+    if not self.document or not self.document.current_doc:
+        return False
+    try:
+        total = self.document.current_doc.page_count
+        start_at = insert_at_page if insert_before else insert_at_page + 1
+        if start_at >= total:
+            start_at = -1  # append at end
 
-    @staticmethod
-    def _mount_via_kiofuse(url: str, timeout: float = 30.0) -> str:
-        if not sys.platform.startswith("linux") or shutil.which("dbus-send") is None:
-            return ""
-        try:
-            result = subprocess.run(
-                ["dbus-send", "--session", "--print-reply", "--type=method_call",
-                 "--dest=org.kde.KIOFuse", "/org/kde/KIOFuse",
-                 "org.kde.KIOFuse.VFS.mountUrl", f"string:{url}"],
-                capture_output=True, text=True, timeout=timeout,
-                env=NativeFileDialog._clean_env(),
-            )
-        except subprocess.TimeoutExpired:
-            print(f"[NativeFileDialog] kio-fuse mount timed out for {url}")
-            return ""
-        except Exception as e:
-            print(f"[NativeFileDialog] kio-fuse mount call failed: {e}")
-            return ""
+        self.document.insert_pdf(new_doc, start_at=start_at)
 
-        if result.returncode != 0:
-            print(f"[NativeFileDialog] kio-fuse mount failed for {url}: {result.stderr.strip()}")
-            return ""
+        self.page_cache.clear()
+        self.reinitializePageWidgets()
+        self.doc_changing()
+        self.refresh_render()
+        return True
+    except Exception as e:
+        print(f"[PDFViewer] insert_document error: {e}")
+        return False
+```
 
-        match = re.search(r'string "((?:[^"\\]|\\.)*)"', result.stdout)
-        if not match:
-            print(f"[NativeFileDialog] kio-fuse gave no path for {url}: {result.stdout.strip()}")
-            return ""
-
-        mounted_path = match.group(1)
-        NativeFileDialog._kiofuse_mounted_paths[mounted_path] = url
-        print(f"[NativeFileDialog] kio-fuse mounted {url} -> {mounted_path}")
-        return mounted_path
-
-    @staticmethod
-    def _url_to_path(raw: str) -> str:
-        parsed = urlparse(raw.strip())
-        if parsed.scheme in ("", "file"):
-            return unquote(parsed.path) if parsed.scheme == "file" else raw
-        mounted = NativeFileDialog._mount_via_kiofuse(raw.strip())
-        return mounted or raw
-
-    @staticmethod
-    def resolve_dropped_url(url) -> str:
-        if url.isLocalFile():
-            return url.toLocalFile()
-        remote = url.toString()
-        print(f"[NativeFileDialog] dropped URL isn't local, trying kio-fuse: {remote}")
-        return NativeFileDialog._mount_via_kiofuse(remote)
-
-    @staticmethod
-    def is_remote_mount(path: str) -> bool:
-        """True if *path* is a kio-fuse-mounted remote resource — bulk writes
-        through it are much slower than KIO's native transfer."""
-        if path in NativeFileDialog._kiofuse_mounted_paths:
-            return True
-        return "/kio-fuse-" in path
-
-    @staticmethod
-    def get_kiofuse_source_url(path: str) -> str:
-        return NativeFileDialog._kiofuse_mounted_paths.get(path, "")
-
-    @staticmethod
-    def transfer_to(local_source: str, destination: str):
-        """Copy local_source's bytes to destination. Uses kioclient against
-        the original KIO URL when destination is a kio-fuse mount we
-        resolved ourselves (native KIO transfer — measured ~30-60x faster
-        than writing bulk data through the FUSE layer directly). Plain
-        shutil.copyfile otherwise. Raises on failure."""
-        source_url = NativeFileDialog.get_kiofuse_source_url(destination)
-        if source_url:
-            kioclient = (shutil.which("kioclient6") or shutil.which("kioclient5")
-                         or shutil.which("kioclient"))
-            if kioclient:
-                result = subprocess.run(
-                    [kioclient, "copy", local_source, source_url],
-                    capture_output=True, text=True, env=NativeFileDialog._clean_env(),
-                )
-                if result.returncode == 0:
-                    return
-                print(f"[NativeFileDialog] kioclient copy failed ({result.returncode}): "
-                      f"{result.stderr.strip()} — falling back to direct copy")
-            else:
-                print("[NativeFileDialog] no kioclient found — falling back to direct copy through FUSE (slow)")
-        shutil.copyfile(local_source, destination)
-
-    @staticmethod
-    def buffered_save(save_fn, target_path: str) -> bool:
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(target_path)[1] or ".pdf")
-        os.close(fd)
-        try:
-            t0 = time.time()
-            if not save_fn(tmp_path):
-                return False
-            t1 = time.time()
-            NativeFileDialog.transfer_to(tmp_path, target_path)
-            t2 = time.time()
-            size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
-            print(f"[NativeFileDialog] buffered_save: {size_mb:.1f}MB — "
-                  f"local write {t1-t0:.1f}s, transfer {t2-t1:.1f}s")
-            return True
-        except Exception as e:
-            print(f"[NativeFileDialog] buffered save to {target_path} failed: {e}")
-            return False
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-    @staticmethod
-    def get_save_file_name(parent, caption: str, directory: str, filter: str):
-        if NativeFileDialog._kdialog_available():
-            raw = NativeFileDialog._run_kdialog(
-                ["kdialog", "--title", caption, "--getsaveurl", directory, filter]
-            )
-            return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
-        return QFileDialog.getSaveFileName(parent, caption, directory, filter)
-
-    @staticmethod
-    def get_open_file_name(parent, caption: str, directory: str, filter: str):
-        if NativeFileDialog._kdialog_available():
-            raw = NativeFileDialog._run_kdialog(
-                ["kdialog", "--title", caption, "--getopenurl", directory, filter]
-            )
-            return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
-        return QFileDialog.getOpenFileName(parent, caption, directory, filter)
-
-
-
-
-
-
-
-
-
+**`file_inserting.py`** — `_do_merge_flow` shrinks a lot; `_merging()` is now dead code, safe to delete:
+```python
 def _do_merge_flow(self, source_path: str):
     self.cur_doc     = self.pv.document.current_doc
     current_page     = self.pv.get_current_page()
-    original_path    = self.pv.doc_path  # capture before anything closes/reopens
 
     dialog = InsertPageDialogue(
         self.main_window,
@@ -215,58 +52,73 @@ def _do_merge_flow(self, source_path: str):
         return
 
     location, target, page_num = dialog.get_insertion_settings()
-    insert_at_page  = page_num - 1
-    insert_before   = (location == "before")
-
-    self.merged_doc = fitz.open()
+    insert_before = (location == "before")
 
     if target == "first":
-        self._merging(insert_before, 0)
+        insert_at_page = 0
     elif target == "last":
-        self._merging(insert_before, len(self.cur_doc) - 1)
+        insert_at_page = self.cur_doc.page_count - 1
     else:
-        self._merging(insert_before, insert_at_page)
+        insert_at_page = page_num - 1
 
-    fd, merged_path = tempfile.mkstemp(suffix=".pdf")
-    os.close(fd)
-    self.merged_doc.save(merged_path)
-    self.merged_doc.close()
+    success = self.pv.insert_document(self.new_doc, insert_before, insert_at_page)
     self.new_doc.close()
 
-    # Close first — original_path's handle must be released before
-    # overwriting it, same reasoning as save_file_as()'s close-then-reopen.
-    self.pv.close_document()
-
-    transfer_ok = True
-    try:
-        NativeFileDialog.transfer_to(merged_path, original_path)
-    except Exception as e:
-        transfer_ok = False
-        QMessageBox.critical(self.main_window, "Ошибка",
-                             f"Не удалось сохранить объединённый файл:\n{e}")
-    finally:
-        try:
-            os.remove(merged_path)
-        except OSError:
-            pass
-
-    success = self.pv.open_document(original_path)
-
     if success:
-        self.pv.doc_path = original_path
         if hasattr(self.ui, 'thumbnailList'):
             try:
-                self.ui.thumbnailList.set_document(self.pv.document)
+                self.ui.thumbnailList.refresh_thumbnails(self.pv.document)
             except Exception as e:
                 print(f"Thumbnail update failed: {e}")
-        if transfer_ok:
-            self.pv.is_modified = True
-            self.main_window.is_document_modified = True
-            self.main_window.update_ui_state()
-            self.main_window.update_page_info()
-            QMessageBox.information(self.main_window, "Успех",
-                                    "Файл успешно вставлен!")
+        self.main_window.update_ui_state()
+        self.main_window.update_page_info()
+        QMessageBox.information(self.main_window, "Успех",
+                                "Файл успешно вставлен! Не забудьте сохранить документ.")
     else:
         QMessageBox.critical(self.main_window, "Ошибка",
-                             "Не удалось открыть результирующий документ.")
+                             "Не удалось вставить файл в документ.")
+```
 
+---
+
+Now the dialog swaps. Add `get_existing_directory` to `native_file_dialog.py` (kdialog's directory-picker doesn't have a documented `*url` variant like Open/Save do, so this one's local-focused, though it's still piped through `_url_to_path` defensively in case that's wrong):
+```python
+@staticmethod
+def get_existing_directory(parent, caption: str, directory: str):
+    if NativeFileDialog._kdialog_available():
+        raw = NativeFileDialog._run_kdialog(
+            ["kdialog", "--title", caption, "--getexistingdirectory", directory]
+        )
+        if raw:
+            return NativeFileDialog._url_to_path(raw)
+    return QFileDialog.getExistingDirectory(parent, caption, directory)
+```
+
+**`file_inserting.py`**, `InsertFile.add_file_to_document()` — add the import up top, swap the call (single filter group already, safe drop-in):
+```python
+file_path, _ = NativeFileDialog.get_open_file_name(
+    self.main_window,
+    "Выберите файл для добавления",
+    "",
+    "PDF Files and Images (*.pdf *.png *.bmp *.jpg *.jpeg)"
+)
+```
+
+**`actions_handler.py`**, `export_pages()`:
+```python
+output_dir = NativeFileDialog.get_existing_directory(
+    self.main_window,
+    "Выберите папку для сохранения",
+    last_dir,
+)
+```
+
+**`actions_handler.py`**, `compress_pdf()` — one thing to flag: this one uses Qt's `;;`-multi-filter syntax (`"PDF Files (*.pdf);;All Files (*)"`), which kdialog doesn't parse the same way (it wants filter groups newline-separated, not semicolon-separated). Rather than risk a garbled filter dropdown, I dropped the second group — you're always saving a compressed PDF here, "All Files" wasn't buying much:
+```python
+output_path, _ = NativeFileDialog.get_save_file_name(
+    self.main_window,
+    "Сохранить сжатый PDF файл как...",
+    default_path,
+    "PDF Files (*.pdf)"
+)
+```
