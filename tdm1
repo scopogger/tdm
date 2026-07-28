@@ -1,254 +1,363 @@
-
-
-## Save As slow again — turns out we don't need the reopen at all
-
-```python
-# actions_handler.py, save_file_as() — replace the "if ok:" block with:
-if ok:
-    # save() doesn't touch the in-memory document, just writes a copy —
-    # no need to close/reopen, just repoint doc_path. Bonus: zoom/scroll
-    # position now survive a Save As instead of resetting.
-    pv.doc_path = file_path
-    if pv.document:
-        pv.document.file_path = file_path
-
-    self.main_window.current_document_path = file_path
-    if hasattr(self.main_window, 'setWindowTitle'):
-        filename = os.path.basename(file_path)
-        self.main_window.setWindowTitle(f"{APP_NAME} — {filename}")
-    self._mark_not_modified()
-    settings_manager.add_recent_file(file_path)
-    self.update_recent_files_menu()
-    return True
-
-QMessageBox.critical(self.main_window, "Ошибка при сохранении", "Не удалось сохранить документ.")
-return False
-```
-This also removes the zoom-reset side effect from a while back — worth specifically checking that scroll/zoom now stay put through a Save As, and that a plain Save right after still correctly targets the new path.
-
-## Compress-to-server slowness — same bug as Save As, different call site
-
-`compress_pdf()` never got the buffering treatment — Ghostscript writes straight to `-sOutputFile=<path>`, and if that path is a kio-fuse mount, it's the exact same slow-small-writes-through-FUSE problem, just from Ghostscript's side instead of fitz's. Folded into the rewrite below (GS always writes to a local temp file, then `NativeFileDialog.transfer_to()` moves it).
-
-## Progress bar + real cancellation
-
-This needed a bigger change: `subprocess.run()` blocks the whole app until Ghostscript exits, so there was never a chance for a Cancel click to do anything — which is exactly why closing the app didn't stop it either. Switching to `QProcess` (Qt's async process type) fixes both: it integrates with the event loop so a Cancel button actually works, and `.kill()` sends the signal immediately.
-
-One thing I can't verify from here: the progress bar's page-by-page animation depends on Ghostscript printing `Page N` as it works (which needs dropping `-dQUIET`) — this is standard GS behavior, but if your build formats it differently, you'll still get a working, cancelable dialog, just without the bar filling in. Let me know what the console shows if it doesn't animate.
-
-Add near the top of `actions_handler.py` (above `class ActionsHandler`):
-```python
+import os
 import re
-from PySide6.QtCore import QProcess, QProcessEnvironment, QObject, Signal
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import urlparse, unquote
+
+from PySide6.QtWidgets import QFileDialog
 
 
-class CompressWorker(QObject):
-    progress = Signal(int, int)   # current page, total pages
-    finished = Signal(bool, str)  # success, error message ("" if cancelled)
+class NativeFileDialog:
+    """Drop-in replacement for QFileDialog.getSaveFileName/getOpenFileName.
+    On Linux with a working kdialog, uses it (same KIO widget Dolphin uses).
+    Remote picks (smb://, sftp://...) get resolved to a real local path via
+    KDE's kio-fuse daemon. Falls back to the plain Qt dialog if kdialog is
+    missing or broken."""
 
-    def __init__(self, gs_path, input_path, tmp_output, quality_value, total_pages, parent=None):
-        super().__init__(parent)
-        self.total_pages = max(1, total_pages)
-        self._stderr_tail = ""
-        self._cancelled = False
+    _kdialog_ok = None
+    _kiofuse_mounted_paths: set = set()
 
-        env = QProcessEnvironment.systemEnvironment()
+    @staticmethod
+    def _clean_env() -> dict:
+        env = os.environ.copy()
         if sys.platform.startswith("linux"):
-            orig = env.value("LD_LIBRARY_PATH_ORIG")
-            if orig:
-                env.insert("LD_LIBRARY_PATH", orig)
+            if 'LD_LIBRARY_PATH_ORIG' in env:
+                env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
             else:
-                env.remove("LD_LIBRARY_PATH")
+                env.pop('LD_LIBRARY_PATH', None)
+        return env
 
-        self.process = QProcess(self)
-        self.process.setProcessEnvironment(env)
-        self.process.setProgram(gs_path)
-        self.process.setArguments([
-            "-sDEVICE=pdfwrite",
-            "-dCompatibilityLevel=1.4",
-            f"-dPDFSETTINGS={quality_value}",
-            "-dNOPAUSE",
-            "-dBATCH",
-            f"-sOutputFile={tmp_output}",
-            input_path,
-        ])
-        self.process.readyReadStandardOutput.connect(self._on_output)
-        self.process.readyReadStandardError.connect(self._on_output)
-        self.process.finished.connect(self._on_finished)
-        self.process.errorOccurred.connect(self._on_error)
+    @staticmethod
+    def _kdialog_available() -> bool:
+        if not sys.platform.startswith("linux"):
+            return False
+        if NativeFileDialog._kdialog_ok is True:
+            return True
+        if shutil.which("kdialog") is None:
+            print("[NativeFileDialog] kdialog not found on PATH")
+            NativeFileDialog._kdialog_ok = False
+            return False
+        try:
+            result = subprocess.run(
+                ["kdialog", "--version"], capture_output=True, text=True,
+                timeout=5, env=NativeFileDialog._clean_env(),
+            )
+            NativeFileDialog._kdialog_ok = (result.returncode == 0)
+            if not NativeFileDialog._kdialog_ok:
+                print(f"[NativeFileDialog] kdialog self-test exit {result.returncode}: "
+                      f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}")
+        except Exception as e:
+            print(f"[NativeFileDialog] kdialog self-test failed: {e}")
+            NativeFileDialog._kdialog_ok = False
+        return NativeFileDialog._kdialog_ok
 
-    def start(self):
-        self.process.start()
+    @staticmethod
+    def _run_kdialog(args: list) -> str:
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True, env=NativeFileDialog._clean_env(),
+            )
+        except Exception as e:
+            print(f"[NativeFileDialog] kdialog call failed: {e}")
+            return ""
+        raw = result.stdout.strip()
+        if raw:
+            return raw
+        if result.stderr.strip():
+            print(f"[NativeFileDialog] kdialog exit {result.returncode}, no selection. "
+                  f"stderr: {result.stderr.strip()}")
+        return ""
 
-    def cancel(self):
-        self._cancelled = True
-        self.process.kill()
+    @staticmethod
+    def _mount_via_kiofuse(url: str, timeout: float = 30.0) -> str:
+        if not sys.platform.startswith("linux") or shutil.which("dbus-send") is None:
+            return ""
+        try:
+            result = subprocess.run(
+                ["dbus-send", "--session", "--print-reply", "--type=method_call",
+                 "--dest=org.kde.KIOFuse", "/org/kde/KIOFuse",
+                 "org.kde.KIOFuse.VFS.mountUrl", f"string:{url}"],
+                capture_output=True, text=True, timeout=timeout,
+                env=NativeFileDialog._clean_env(),
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[NativeFileDialog] kio-fuse mount timed out for {url}")
+            return ""
+        except Exception as e:
+            print(f"[NativeFileDialog] kio-fuse mount call failed: {e}")
+            return ""
 
-    def _on_output(self):
-        data = (bytes(self.process.readAllStandardOutput()).decode(errors='replace') +
-                bytes(self.process.readAllStandardError()).decode(errors='replace'))
-        self._stderr_tail = (self._stderr_tail + data)[-2000:]
-        for match in re.finditer(r'\bPage (\d+)\b', data):
-            self.progress.emit(int(match.group(1)), self.total_pages)
+        if result.returncode != 0:
+            print(f"[NativeFileDialog] kio-fuse mount failed for {url}: {result.stderr.strip()}")
+            return ""
 
-    def _on_error(self, error):
-        if not self._cancelled:
-            self.finished.emit(False, f"Не удалось запустить Ghostscript: {error}")
+        match = re.search(r'string "((?:[^"\\]|\\.)*)"', result.stdout)
+        if not match:
+            print(f"[NativeFileDialog] kio-fuse gave no path for {url}: {result.stdout.strip()}")
+            return ""
 
-    def _on_finished(self, exit_code, exit_status):
-        if self._cancelled:
-            self.finished.emit(False, "")  # empty message = don't show an error box
-            return
-        if exit_status == QProcess.ExitStatus.CrashExit:
-            self.finished.emit(False, "Процесс сжатия был прерван.")
-            return
-        if exit_code != 0:
-            self.finished.emit(False, self._stderr_tail.strip() or f"Ghostscript завершился с кодом {exit_code}")
-            return
-        self.finished.emit(True, "")
-```
+        mounted_path = match.group(1)
+        NativeFileDialog._kiofuse_mounted_paths.add(mounted_path)
+        print(f"[NativeFileDialog] kio-fuse mounted {url} -> {mounted_path}")
+        return mounted_path
 
-Replace `compress_pdf()` itself:
-```python
-def compress_pdf(self):
-    gs_path = self.get_ghostscript_path()
-    if not gs_path:
-        QMessageBox.warning(self.main_window, "Ошибка сжатия", "Не найдена библиотека для сжатия файлов.")
-        return
+    @staticmethod
+    def _url_to_path(raw: str) -> str:
+        parsed = urlparse(raw.strip())
+        if parsed.scheme in ("", "file"):
+            return unquote(parsed.path) if parsed.scheme == "file" else raw
+        mounted = NativeFileDialog._mount_via_kiofuse(raw.strip())
+        return mounted or raw
 
-    current_path = getattr(self.main_window, 'current_document_path', '')
-    if not current_path:
-        QMessageBox.warning(self.main_window, "Нет документа", "Пожалуйста, сначала откройте PDF файл.")
-        return
+    @staticmethod
+    def resolve_dropped_url(url) -> str:
+        if url.isLocalFile():
+            return url.toLocalFile()
+        remote = url.toString()
+        print(f"[NativeFileDialog] dropped URL isn't local, trying kio-fuse: {remote}")
+        return NativeFileDialog._mount_via_kiofuse(remote)
 
-    if getattr(self.main_window, 'is_document_modified', False):
-        clicked_button = self.save_message_box(
-            "", "В документе есть несохраненные изменения. Требуется сохранить их перед сжатием."
-        )
-        if clicked_button == QMessageBox.RejectRole:
-            return
-        elif clicked_button == QMessageBox.YesRole:
-            if not self.save_file():
-                return
+    @staticmethod
+    def is_remote_mount(path: str) -> bool:
+        """True if *path* is a kio-fuse-mounted remote resource — bulk writes
+        there are slower than local disk, worth showing progress for."""
+        if path in NativeFileDialog._kiofuse_mounted_paths:
+            return True
+        return "/kio-fuse-" in path
 
-    default_dir = os.path.dirname(current_path)
-    default_name = os.path.splitext(os.path.basename(current_path))[0] + "_compressed.pdf"
-    default_path = os.path.join(default_dir, default_name)
+    @staticmethod
+    def transfer_to(local_source: str, destination: str, progress_callback=None,
+                    chunk_size: int = 4 * 1024 * 1024):
+        """Copy local_source's bytes to destination in large (default 4MB)
+        chunks instead of the ~64KB shutil.copyfile default. Each write() to
+        a kio-fuse mount is proxied over the network, so fewer/larger writes
+        should mean far fewer round trips — that's the working theory for
+        the earlier slowness, not raw bandwidth. progress_callback(done,
+        total), if given, fires once per chunk.
 
-    output_path, _ = NativeFileDialog.get_save_file_name(
-        self.main_window, "Сохранить сжатый PDF файл как...", default_path, "PDF Files (*.pdf)"
-    )
-    if not output_path:
-        return
-    if not output_path.lower().endswith('.pdf'):
-        output_path += '.pdf'
+        (Previously tried routing through `kioclient copy` here instead —
+        measured slower in practice than a plain copy, not faster as I'd
+        assumed, so that's gone. This is simpler and gives real progress.)"""
+        total = os.path.getsize(local_source)
+        written = 0
+        with open(local_source, 'rb') as src, open(destination, 'wb') as dst:
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                written += len(chunk)
+                if progress_callback:
+                    progress_callback(written, total)
 
-    if os.path.abspath(output_path) == os.path.abspath(current_path):
-        reply = QMessageBox.question(
-            self.main_window, "Перезапись файла",
-            "Вы пытаетесь сохранить сжатый файл поверх исходного.\n"
-            "Это приведёт к потере исходного файла. Вы уверены?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
+    @staticmethod
+    def buffered_save(save_fn, target_path: str, progress_callback=None) -> bool:
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(target_path)[1] or ".pdf")
+        os.close(fd)
+        try:
+            t0 = time.time()
+            if not save_fn(tmp_path):
+                return False
+            t1 = time.time()
+            NativeFileDialog.transfer_to(tmp_path, target_path, progress_callback=progress_callback)
+            t2 = time.time()
+            size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+            transfer_time = max(t2 - t1, 0.001)
+            print(f"[NativeFileDialog] buffered_save: {size_mb:.1f}MB — "
+                  f"local write {t1-t0:.1f}s, transfer {t2-t1:.1f}s ({size_mb/transfer_time:.2f} MB/s)")
+            return True
+        except Exception as e:
+            print(f"[NativeFileDialog] buffered save to {target_path} failed: {e}")
+            return False
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
-    quality_options = {
-        "Максимальное сжатие": "/screen",
-        "Высокое": "/printer",
-        "Среднее": "/ebook",
-        "Слабое сжатие": "/prepress",
-    }
-    dialog = QInputDialog(self.main_window)
-    dialog.setWindowTitle("Качество сжатия:")
-    dialog.setLabelText("Выберите уровень сжатия:")
-    dialog.setComboBoxItems(list(quality_options.keys()))
-    dialog.setComboBoxEditable(False)
-    dialog.setTextValue(list(quality_options)[2])
-    dialog.setModal(True)
-    dialog.setFixedSize(280, 130)
-    if dialog.exec() == QInputDialog.DialogCode.Accepted:
-        quality_value = quality_options[dialog.textValue()]
-    else:
-        return
+    @staticmethod
+    def get_existing_directory(parent, caption: str, directory: str):
+        if NativeFileDialog._kdialog_available():
+            raw = NativeFileDialog._run_kdialog(
+                ["kdialog", "--title", caption, "--getexistingdirectory", directory]
+            )
+            if raw:
+                return NativeFileDialog._url_to_path(raw)
+        return QFileDialog.getExistingDirectory(parent, caption, directory)
 
-    if not os.path.isfile(current_path):
-        QMessageBox.critical(self.main_window, "Ошибка сжатия", f"Файл {current_path} не найден")
-        return
+    @staticmethod
+    def get_save_file_name(parent, caption: str, directory: str, filter: str):
+        if NativeFileDialog._kdialog_available():
+            raw = NativeFileDialog._run_kdialog(
+                ["kdialog", "--title", caption, "--getsaveurl", directory, filter]
+            )
+            return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
+        return QFileDialog.getSaveFileName(parent, caption, directory, filter)
 
-    total_pages = 1
+    @staticmethod
+    def get_open_file_name(parent, caption: str, directory: str, filter: str):
+        if NativeFileDialog._kdialog_available():
+            raw = NativeFileDialog._run_kdialog(
+                ["kdialog", "--title", caption, "--getopenurl", directory, filter]
+            )
+            return (NativeFileDialog._url_to_path(raw), filter) if raw else ("", "")
+        return QFileDialog.getOpenFileName(parent, caption, directory, filter)
+
+
+
+
+
+def save_changes(self, file_path: str = None, progress_callback=None) -> bool:
+    if not self.document:
+        return True
     try:
-        _tmp_doc = fitz.open(current_path)
-        total_pages = _tmp_doc.page_count
-        _tmp_doc.close()
+        if file_path:
+            save_path = file_path
+        elif hasattr(self, '_original_doc_path') and self._original_doc_path:
+            save_path = self._original_doc_path
+        else:
+            save_path = self.doc_path
+
+        is_incremental = (save_path == self.doc_path)
+
+        def _do_save(path: str) -> bool:
+            try:
+                self.document.save(path, is_incremental)
+                return True
+            except Exception as e:
+                print(f"ERROR {e}")
+                return False
+
+        if not is_incremental and NativeFileDialog.is_remote_mount(save_path):
+            return NativeFileDialog.buffered_save(_do_save, save_path, progress_callback=progress_callback)
+
+        return _do_save(save_path)
+    except Exception as e:
+        QMessageBox.critical(None, "Save Error", f"Failed to save PDF: {e}")
+        return False
+
+
+
+
+
+def save_file_as(self) -> bool:
+    pv = getattr(self.ui, 'pdfView', None)
+    if not pv:
+        return False
+
+    last_dir = settings_manager.get_last_directory()
+    base = os.path.splitext(os.path.basename(getattr(self.main_window, 'current_document_path', '') or 'document'))[0]
+    default_name = f"{base}_modified.pdf" if base else "document.pdf"
+    file_path, _ = NativeFileDialog.get_save_file_name(
+        self.main_window, "Save PDF As", os.path.join(last_dir, default_name), "PDF Files (*.pdf)"
+    )
+    if not file_path:
+        return False
+
+    settings_manager.save_last_directory(os.path.dirname(file_path))
+
+    try:
+        if hasattr(pv, 'merge_annotations_to_document'):
+            pv.merge_annotations_to_document()
     except Exception:
         pass
 
-    fd, tmp_output = tempfile.mkstemp(suffix=".pdf")
-    os.close(fd)
+    progress_dlg = None
+    progress_callback = None
+    if NativeFileDialog.is_remote_mount(file_path):
+        progress_dlg = QProgressDialog("Сохранение на сервер…", "", 0, 100, self.main_window)
+        progress_dlg.setWindowModality(Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
 
-    progress_dlg = QProgressDialog("Сжатие документа…", "Отмена", 0, total_pages, self.main_window)
-    progress_dlg.setWindowModality(Qt.WindowModal)
-    progress_dlg.setMinimumDuration(0)
-    progress_dlg.setValue(0)
+        def progress_callback(done, total):
+            if total:
+                progress_dlg.setValue(int(done * 100 / total))
+            QApplication.processEvents()
 
-    worker = CompressWorker(gs_path, current_path, tmp_output, quality_value, total_pages, parent=self.main_window)
-    self._compress_worker = worker  # keep alive until finished — don't let it get GC'd mid-run
+    ok = False
+    if hasattr(pv, 'save_changes'):
+        ok = bool(pv.save_changes(file_path, progress_callback=progress_callback))
+    elif hasattr(pv, 'save_document'):
+        ok = bool(pv.save_document(file_path))
 
-    def _cleanup_tmp():
-        try:
-            os.remove(tmp_output)
-        except OSError:
-            pass
-
-    def _on_progress(current, total):
-        if total != progress_dlg.maximum():
-            progress_dlg.setMaximum(total)
-        progress_dlg.setValue(current)
-
-    def _on_finished(success, error_message):
+    if progress_dlg:
         progress_dlg.close()
-        self._compress_worker = None
 
-        if not success:
-            _cleanup_tmp()
-            if error_message:
-                QMessageBox.critical(self.main_window, "Ошибка сжатия", f"При сжатии произошла ошибка: {error_message}")
+    if ok:
+        pv.doc_path = file_path
+        if pv.document:
+            pv.document.file_path = file_path
+        self.main_window.current_document_path = file_path
+        if hasattr(self.main_window, 'setWindowTitle'):
+            self.main_window.setWindowTitle(f"{APP_NAME} — {os.path.basename(file_path)}")
+        self._mark_not_modified()
+        settings_manager.add_recent_file(file_path)
+        self.update_recent_files_menu()
+        return True
+
+    QMessageBox.critical(self.main_window, "Ошибка при сохранении", "Не удалось сохранить документ.")
+    return False
+
+
+
+
+def _on_finished(success, error_message):
+    self._compress_worker = None
+
+    if not success:
+        progress_dlg.close()
+        _cleanup_tmp()
+        if error_message:
+            QMessageBox.critical(self.main_window, "Ошибка сжатия", f"При сжатии произошла ошибка: {error_message}")
+        return
+
+    try:
+        if not os.path.isfile(tmp_output):
+            progress_dlg.close()
+            QMessageBox.critical(self.main_window, "Ошибка сохранения", "Сжатие произвелось, но временный файл не создан.")
             return
 
-        try:
-            if not os.path.isfile(tmp_output):
-                QMessageBox.critical(self.main_window, "Ошибка сохранения", "Сжатие произвелось, но временный файл не создан.")
-                return
+        size_original = os.path.getsize(current_path) / 1024
+        size_compressed = os.path.getsize(tmp_output) / 1024
 
-            size_original = os.path.getsize(current_path) / 1024
-            size_compressed = os.path.getsize(tmp_output) / 1024
-
-            if size_compressed >= size_original:
-                _cleanup_tmp()
-                QMessageBox.information(
-                    self.main_window, "",
-                    "Оригинальный документ уже сжат до минимального объёма.\nНовая сжатая версия не будет создана."
-                )
-                return
-
-            NativeFileDialog.transfer_to(tmp_output, output_path)
-            compressed_ratio = (1 - size_compressed / size_original) * 100
-            QMessageBox.information(
-                self.main_window, "Сжатие завершено",
-                f"Файл сохранён как: {output_path}\n\n"
-                f"Размер исходного файла: {size_original:.1f} КБ\n"
-                f"Размер сжатого файла: {size_compressed:.1f} КБ\n"
-                f"Сжато на {compressed_ratio:.1f}%"
-            )
-        except Exception as e:
-            QMessageBox.critical(self.main_window, "Ошибка сохранения", f"Не удалось сохранить сжатый файл: {e}")
-        finally:
+        if size_compressed >= size_original:
+            progress_dlg.close()
             _cleanup_tmp()
+            QMessageBox.information(
+                self.main_window, "",
+                "Оригинальный документ уже сжат до минимального объёма.\nНовая сжатая версия не будет создана."
+            )
+            return
 
-    worker.progress.connect(_on_progress)
-    worker.finished.connect(_on_finished)
-    progress_dlg.canceled.connect(worker.cancel)
+        if NativeFileDialog.is_remote_mount(output_path):
+            progress_dlg.setLabelText("Сохранение на сервер…")
+            progress_dlg.setValue(0)
 
-    worker.start()
-```
+            def _on_transfer_progress(done, total):
+                if total:
+                    progress_dlg.setValue(int(done * 100 / total))
+                QApplication.processEvents()
+
+            NativeFileDialog.transfer_to(tmp_output, output_path, progress_callback=_on_transfer_progress)
+        else:
+            NativeFileDialog.transfer_to(tmp_output, output_path)
+
+        progress_dlg.close()
+        compressed_ratio = (1 - size_compressed / size_original) * 100
+        QMessageBox.information(
+            self.main_window, "Сжатие завершено",
+            f"Файл сохранён как: {output_path}\n\n"
+            f"Размер исходного файла: {size_original:.1f} КБ\n"
+            f"Размер сжатого файла: {size_compressed:.1f} КБ\n"
+            f"Сжато на {compressed_ratio:.1f}%"
+        )
+    except Exception as e:
+        progress_dlg.close()
+        QMessageBox.critical(self.main_window, "Ошибка сохранения", f"Не удалось сохранить сжатый файл: {e}")
+    finally:
+        _cleanup_tmp()
+
