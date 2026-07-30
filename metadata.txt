@@ -1,0 +1,18 @@
+[general]
+name=Selection Intersector
+qgisMinimumVersion=3.28
+description=Draw a polygon and get a live-updating layer of features from selected layers/groups that intersect it
+version=0.1.0
+author=Your Name
+email=you@example.com
+
+about=Draw an arbitrary polygon, choose which layers or layer groups to check against it, and get output layer(s) of the intersecting features. The output stays in sync automatically as source layers change (within the QGIS session, and via PostgreSQL NOTIFY for PostGIS layers -- see README.md) or as the polygon is redrawn.
+
+tracker=
+repository=
+hasProcessingProvider=no
+tags=vector,intersection,polygon,overlay,postgis
+category=Vector
+experimental=True
+deprecated=False
+server=False
