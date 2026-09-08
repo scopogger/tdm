@@ -1,0 +1,18 @@
+[general]
+name=Copy & Correct
+qgisMinimumVersion=3.28
+description=Copy selected features from one or more layers into an existing layer, reviewing and correcting attributes one feature at a time
+version=0.1.0
+author=Your Name
+email=you@example.com
+
+about=Select features on one or more layers, then run this tool to copy them into an existing target layer. Each copied feature's attribute form opens one at a time so you can correct it; whichever fields you actually change carry forward as the starting values for the next feature, so a value repeated across many objects only needs to be entered once. The feature currently being edited is highlighted on the map.
+
+tracker=
+repository=
+hasProcessingProvider=no
+tags=vector,copy,attributes,batch edit
+category=Vector
+experimental=True
+deprecated=False
+server=False
