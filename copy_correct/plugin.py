@@ -296,6 +296,7 @@ class CopyCorrectPlugin:
             # featureOwner=False: we keep our own reference (new_feat/fid)
             # rather than handing the feature's lifetime to the dialog.
             dlg = QgsAttributeDialog(target_layer, new_feat, False, self.iface.mainWindow())
+            dlg.setWindowTitle('Атрибуты объекта')
             dlg.setAttribute(Qt.WA_DeleteOnClose)
             dlg.finished.connect(self._on_feature_form_finished)
             self._current_dialog = dlg
@@ -315,7 +316,7 @@ class CopyCorrectPlugin:
         self._rubber_band.setToGeometry(geometry, target_layer)
 
         if not canvas.extent().contains(geometry.boundingBox()):
-            canvas.zoomToFeatureIds(target_layer, {self._review['pending_fid']})
+            canvas.zoomToFeatureIds(target_layer, [self._review['pending_fid']])
         canvas.refresh()
 
     def _on_feature_form_finished(self, result):
