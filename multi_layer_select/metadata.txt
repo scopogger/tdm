@@ -1,17 +1,17 @@
 [general]
-name=Select Across Layers
+name=Выбор по нескольким слоям
 qgisMinimumVersion=3.28
-description=Highlight several layers in the Layers panel, then draw one rectangle on the map to select matching features on all of them at once
+description=Выделите несколько слоёв в панели «Слои», затем одним прямоугольником на карте выберите объекты сразу на всех них
 version=0.1.0
 author=Your Name
 email=you@example.com
 
-about=QGIS's native selection tools only ever act on the single active layer. This tool reads whichever layers are highlighted in the Layers panel (the normal Ctrl/Shift-click multi-select QGIS already supports there) and applies one rectangle drag to all of them at once. Shift adds to each layer's existing selection, Ctrl removes from it, matching the native tools' conventions. Falls back to the active layer if nothing is highlighted in the panel.
+about=Стандартные инструменты выбора в QGIS всегда работают только с одним активным слоем. Этот инструмент смотрит, какие слои выделены в панели «Слои» (обычное выделение по Ctrl/Shift, уже поддерживаемое QGIS), и применяет одно перетаскивание прямоугольника сразу ко всем ним. Shift добавляет к текущему выбору каждого слоя, Ctrl — убирает из него, как в стандартных инструментах. Если в панели ничего не выделено, используется активный слой.
 
 tracker=
 repository=
 hasProcessingProvider=no
-tags=vector,selection,utility,layers
+tags=векторные слои,выбор,утилита,слои
 category=Vector
 experimental=True
 deprecated=False
