@@ -1,17 +1,17 @@
 [general]
-name=Copy & Correct
+name=Копирование с проверкой
 qgisMinimumVersion=3.28
-description=Copy selected features from one or more layers into an existing layer, reviewing and correcting attributes one feature at a time
+description=Копирует выбранные объекты с одного или нескольких слоёв в существующий слой, позволяя проверить и исправить атрибуты каждого объекта по очереди
 version=0.1.0
 author=Your Name
 email=you@example.com
 
-about=Select features on one or more layers, then run this tool to copy them into an existing target layer. Each copied feature's attribute form opens one at a time so you can correct it; whichever fields you actually change carry forward as the starting values for the next feature, so a value repeated across many objects only needs to be entered once. The feature currently being edited is highlighted on the map.
+about=Выделите объекты на одном или нескольких слоях, затем запустите инструмент, чтобы скопировать их в существующий слой назначения. Форма атрибутов каждого скопированного объекта открывается по очереди, чтобы вы могли её проверить и исправить; поля, которые вы действительно изменили, переносятся как начальные значения для следующего объекта — значение, повторяющееся у многих объектов, достаточно ввести один раз. Объект, который редактируется в данный момент, подсвечивается на карте.
 
 tracker=
 repository=
 hasProcessingProvider=no
-tags=vector,copy,attributes,batch edit
+tags=векторные слои,копирование,атрибуты,пакетное редактирование
 category=Vector
 experimental=True
 deprecated=False
