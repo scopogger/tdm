@@ -25,7 +25,16 @@ from qgis.PyQt.QtCore import QPoint, Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import QAction
 
-from qgis.core import Qgis, QgsApplication, QgsGeometry, QgsRectangle, QgsVectorLayer, QgsWkbTypes
+from qgis.core import (
+    Qgis,
+    QgsApplication,
+    QgsCoordinateTransform,
+    QgsGeometry,
+    QgsProject,
+    QgsRectangle,
+    QgsVectorLayer,
+    QgsWkbTypes,
+)
 from qgis.gui import QgsMapTool, QgsRubberBand
 
 try:
@@ -48,6 +57,7 @@ class MultiLayerSelectTool(QgsMapTool):
         self.iface = iface
         self.setCursor(Qt.CrossCursor)
         self._start_px = None
+        self._transform_cache = {}
         self._rubber_band = QgsRubberBand(canvas, QgsWkbTypes.PolygonGeometry)
         self._rubber_band.setFillColor(QColor(0, 120, 250, 60))
         self._rubber_band.setStrokeColor(QColor(0, 120, 250, 220))
@@ -90,6 +100,21 @@ class MultiLayerSelectTool(QgsMapTool):
         rect.normalize()
         self._rubber_band.setToGeometry(QgsGeometry.fromRect(rect), None)
 
+    def _rect_in_layer_crs(self, rect, canvas_crs, layer):
+        """selectByRect() expects the rectangle in the LAYER's own CRS,
+        not the canvas's -- if a layer is being reprojected on the fly
+        (a different CRS from the canvas), using the raw canvas-space
+        rect selects the wrong features entirely, which is what was
+        producing the offset."""
+        if layer.crs() == canvas_crs:
+            return rect
+        key = layer.crs().authid() or layer.crs().toWkt()
+        transform = self._transform_cache.get(key)
+        if transform is None:
+            transform = QgsCoordinateTransform(canvas_crs, layer.crs(), QgsProject.instance())
+            self._transform_cache[key] = transform
+        return transform.transformBoundingBox(rect)
+
     def _select_in_layers(self, rect, modifiers):
         layers = [
             layer for layer in self.iface.layerTreeView().selectedLayers()
@@ -116,8 +141,9 @@ class MultiLayerSelectTool(QgsMapTool):
         else:
             behavior = _SELECT_BEHAVIOR.SetSelection
 
+        canvas_crs = self.canvas().mapSettings().destinationCrs()
         for layer in layers:
-            layer.selectByRect(rect, behavior)
+            layer.selectByRect(self._rect_in_layer_crs(rect, canvas_crs, layer), behavior)
 
         total_selected = sum(layer.selectedFeatureCount() for layer in layers)
         self.iface.messageBar().pushMessage(
@@ -146,10 +172,24 @@ class MultiLayerSelectPlugin:
         self.iface.addToolBarIcon(self.action)
 
         self.tool = MultiLayerSelectTool(self.iface.mapCanvas(), self.iface)
-        self.tool.setAction(self.action)  # keeps the button's checked state in sync
-        self.action.triggered.connect(lambda: self.iface.mapCanvas().setMapTool(self.tool))
+        self.action.triggered.connect(self._activate)
+        self.iface.mapCanvas().mapToolSet.connect(self._on_map_tool_set)
 
     def unload(self):
+        self.iface.mapCanvas().mapToolSet.disconnect(self._on_map_tool_set)
         self.iface.removePluginMenu(self.MENU_NAME, self.action)
         self.iface.removeToolBarIcon(self.action)
         self.tool = None
+
+    def _activate(self):
+        # Qt auto-toggles a checkable action's own checked state on every
+        # click, so clicking the button while it's already active would
+        # otherwise pop it back out without the tool actually
+        # deactivating. Force it back to checked every time -- it only
+        # goes unchecked in `_on_map_tool_set`, when a different tool
+        # genuinely takes over.
+        self.iface.mapCanvas().setMapTool(self.tool)
+        self.action.setChecked(True)
+
+    def _on_map_tool_set(self, new_tool, old_tool):
+        self.action.setChecked(new_tool is self.tool)
