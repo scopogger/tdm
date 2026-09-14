@@ -1,21 +1,24 @@
 """
-Copy & Correct: copy selected features from one or more layers into an
-existing target layer, reviewing and correcting attributes one feature
-at a time.
+Copy & Correct: copy every feature of one or more layers into a target
+layer -- from the project or a database -- reviewing and correcting
+attributes one feature at a time.
 
 Workflow:
-  1. Select features on one or more layers (QGIS keeps selection
-     per-layer; this tool gathers everything currently selected across
-     every vector layer in the project).
-  2. Pick the existing layer to copy into.
-  3. Each selected feature is copied into the target layer in turn.
-     Its attribute form opens automatically, non-modally, so the
-     operator can still pan/zoom the map freely while it's open. The
-     feature is highlighted on the map for as long as its form is
-     open; the view is only re-framed if the feature doesn't already
-     fit inside it -- an object bigger than the current view gets
-     zoomed out to, one that's already visible is left exactly as the
-     operator had it.
+  1. Highlight one or more layers in the Layers panel (the normal
+     Ctrl/Shift-click multi-select QGIS already supports there). No
+     feature-level selection is needed -- every feature of each
+     highlighted layer is included.
+  2. Pick the layer to copy into: an existing project layer, or any
+     table from a configured PostgreSQL connection (loaded on demand,
+     not added to the project). Layers whose geometry type doesn't
+     match what's being copied are shown but can't be picked.
+  3. Each feature is copied into the target layer in turn. Its
+     attribute form opens automatically, non-modally, so the operator
+     can still pan/zoom the map freely while it's open. The feature is
+     highlighted on the map for as long as its form is open; the view
+     is only re-framed if the feature doesn't already fit inside it --
+     an object bigger than the current view gets zoomed out to, one
+     that's already visible is left exactly as the operator had it.
   4. Whichever fields the operator actually changed on one feature
      become the starting values pre-filled for the next feature (and
      stay "sticky" until changed again), so a value that repeats
@@ -123,6 +126,7 @@ class CopyCorrectPlugin:
     """Plugin entry point: registers the toolbar/menu action."""
 
     MENU_NAME = '&Копирование с проверкой'
+    LARGE_BATCH_WARNING = 200  # confirm before opening this many forms one at a time
 
     def __init__(self, iface):
         self.iface = iface
@@ -175,15 +179,29 @@ class CopyCorrectPlugin:
             )
             return
 
-        copy_list = self._gather_selected_features()
+        copy_list = self._gather_layer_features()
         if not copy_list:
             QMessageBox.information(
                 self.iface.mainWindow(),
                 'Копирование объектов',
-                'Не выбрано ни одного объекта.\n'
-                'Выделите объекты на одном или нескольких слоях и повторите.',
+                'Нет объектов для копирования.\n'
+                'Выделите один или несколько векторных слоёв в панели «Слои» '
+                '(в них должны быть объекты) и повторите.',
             )
             return
+
+        if len(copy_list) > self.LARGE_BATCH_WARNING:
+            reply = QMessageBox.question(
+                self.iface.mainWindow(),
+                'Копирование объектов',
+                'Объектов к копированию: {0}.\n'
+                'Форма атрибутов будет открываться для каждого по очереди — '
+                'это может занять много времени. Продолжить?'.format(len(copy_list)),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
         self._pending_copy_list = copy_list
         self._load_target_layer_options()
@@ -286,9 +304,6 @@ class CopyCorrectPlugin:
         filtered = [(layer, feat) for layer, feat in copy_list if layer is not target_layer]
         skipped_self = len(copy_list) - len(filtered)
 
-        for layer in distinct_layers:
-            layer.removeSelection()
-
         if not filtered:
             QMessageBox.information(
                 self.iface.mainWindow(),
@@ -303,15 +318,17 @@ class CopyCorrectPlugin:
     # Internals
     # ------------------------------------------------------------------
 
-    def _gather_selected_features(self):
-        """Collect (layer, feature) pairs for every selected feature on every
-        vector layer in the project. Features are copy-constructed so later
-        clearing the live selection doesn't affect what's stored here."""
+    def _gather_layer_features(self):
+        """Collect (layer, feature) pairs for every feature on every
+        vector layer currently highlighted in the Layers panel -- the
+        whole layer's content, not a feature-level selection within it.
+        Features are copy-constructed so later edits to the source
+        layers don't affect what's stored here."""
         copy_list = []
-        for layer in QgsProject.instance().mapLayers().values():
-            if not isinstance(layer, QgsVectorLayer) or layer.selectedFeatureCount() == 0:
+        for layer in self.iface.layerTreeView().selectedLayers():
+            if not isinstance(layer, QgsVectorLayer):
                 continue
-            for feat in layer.selectedFeatures():
+            for feat in layer.getFeatures():
                 copy_list.append((layer, QgsFeature(feat)))
         return copy_list
 
