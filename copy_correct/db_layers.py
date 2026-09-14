@@ -67,6 +67,7 @@ class LongTaskLoader(QgsTask):
         super().__init__(description, QgsTask.CanCancel)
         self.long_function = long_function
         self.exception = None
+        self._cancelled = False
         self.args = args
         self.kwargs = kwargs
 
@@ -79,6 +80,14 @@ class LongTaskLoader(QgsTask):
             self.exception = e
             self.terminated.emit(e)
             return False
+
+    def cancel(self):
+        self._cancelled = True
+        super().cancel()
+        self.terminated.emit(Exception('Пользователь отменил задачу'))
+
+    def isCancelled(self):
+        return self._cancelled
 
     def setDescription(self, new_desc):
         super().setDescription(new_desc)
