@@ -31,13 +31,15 @@ does not lose the features already confirmed.
 """
 
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtGui import QColor, QStandardItem, QStandardItemModel
 from qgis.PyQt.QtWidgets import (
     QAction,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QLabel,
     QMessageBox,
+    QProgressDialog,
     QVBoxLayout,
 )
 
@@ -46,20 +48,31 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsFeature,
     QgsGeometry,
-    QgsMapLayerProxyModel,
     QgsProject,
     QgsVectorLayer,
     QgsWkbTypes,
 )
-from qgis.gui import QgsAttributeDialog, QgsMapLayerComboBox, QgsRubberBand
+from qgis.gui import QgsAttributeDialog, QgsRubberBand
+
+from .db_layers import (
+    LongTaskLoader,
+    get_connection_credentials,
+    get_db_layer_infos,
+    get_project_layer_infos,
+    resolve_layer,
+)
 
 
 class TargetLayerDialog(QDialog):
-    """Small confirmation dialog: shows what's selected, picks the target layer."""
+    """Confirmation dialog: shows what's selected, picks the target
+    layer from either the current project or any configured PostgreSQL
+    connection. Entries whose geometry type doesn't match what's being
+    copied are shown greyed out and can't be picked."""
 
-    def __init__(self, parent, feature_count, layer_count):
+    def __init__(self, parent, feature_count, layer_count, layers_info, source_geom_types):
         super().__init__(parent)
         self.setWindowTitle('Копирование объектов')
+        self.setMinimumWidth(420)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -67,8 +80,32 @@ class TargetLayerDialog(QDialog):
         ))
         layout.addWidget(QLabel('Слой назначения:'))
 
-        self.layer_combo = QgsMapLayerComboBox(self)
-        self.layer_combo.setFilters(QgsMapLayerProxyModel.VectorLayer)
+        self.layer_combo = QComboBox(self)
+        self.model = QStandardItemModel(self.layer_combo)
+        self.layer_combo.setModel(self.model)
+
+        # Only grey out mismatches when the copied objects are all one
+        # geometry type -- with a mixed batch, any layer might take at
+        # least some of them, so nothing is disqualified up front (the
+        # per-feature check during the actual copy still applies).
+        only_type = next(iter(source_geom_types)) if len(source_geom_types) == 1 else None
+
+        prev_group = None
+        for info in layers_info:
+            if info.connection_name != prev_group:
+                header = QStandardItem('──── {0} ────'.format(info.connection_name))
+                header.setFlags(Qt.NoItemFlags)
+                self.model.appendRow(header)
+                prev_group = info.connection_name
+
+            mismatched = only_type is not None and info.geometry_type != only_type
+            text = info.display_name + (' (другой тип геометрии)' if mismatched else '')
+            self.layer_combo.addItem(text, userData=info)
+            if mismatched:
+                item = self.model.item(self.model.rowCount() - 1)
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                item.setToolTip('Тип геометрии слоя не совпадает с копируемыми объектами.')
+
         layout.addWidget(self.layer_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
@@ -78,8 +115,8 @@ class TargetLayerDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def selected_layer(self):
-        return self.layer_combo.currentLayer()
+    def selected_info(self):
+        return self.layer_combo.currentData()
 
 
 class CopyCorrectPlugin:
@@ -93,6 +130,11 @@ class CopyCorrectPlugin:
         self._current_dialog = None
         self._rubber_band = None
         self._review = None  # holds state for the in-progress copy run, if any
+        self._connections = []  # cached PostgreSQL connections (with resolved credentials)
+        self._layers_info = []  # cached Project + Database target-layer options
+        self._task = None
+        self._progress_dialog = None
+        self._pending_copy_list = None  # copy_list waiting on the async layer load
 
     def initGui(self):
         icon = QgsApplication.getThemeIcon('mActionEditCopy.svg')
@@ -105,6 +147,12 @@ class CopyCorrectPlugin:
         self.iface.removePluginMenu(self.MENU_NAME, self.action)
         self.iface.removeToolBarIcon(self.action)
         self._abort_review()
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        if self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -119,6 +167,13 @@ class CopyCorrectPlugin:
                 '(закройте или подтвердите открытую форму атрибутов).',
             )
             return
+        if self._pending_copy_list is not None or self._task is not None:
+            QMessageBox.information(
+                self.iface.mainWindow(),
+                'Копирование объектов',
+                'Список слоёв ещё загружается — подождите завершения.',
+            )
+            return
 
         copy_list = self._gather_selected_features()
         if not copy_list:
@@ -130,14 +185,100 @@ class CopyCorrectPlugin:
             )
             return
 
+        self._pending_copy_list = copy_list
+        self._load_target_layer_options()
+
+    def _load_target_layer_options(self):
+        """Refreshes the Project+Database layer list off the main
+        thread (matching the org's BufferPlugin), then shows the
+        target-layer picker once it's ready. Credentials are resolved
+        first and synchronously, since the prompt dialog needs the main
+        thread; the potentially slow part (querying each DB connection)
+        runs in the background."""
+        if not self._connections:
+            self._connections = get_connection_credentials()
+
+        task = LongTaskLoader('Загрузка слоёв...', self._load_layers_info, self._connections)
+        task.completed.connect(self._on_layers_loaded)
+        task.terminated.connect(self._on_layers_load_failed)
+        self._task = task
+
+        self._progress_dialog = QProgressDialog(
+            'Загрузка слоёв проекта и базы данных...', 'Отмена', 0, 100, self.iface.mainWindow(),
+        )
+        self._progress_dialog.setWindowModality(Qt.WindowModal)
+        self._progress_dialog.setAutoClose(False)
+        task.descriptionChanged.connect(self._progress_dialog.setLabelText)
+        task.progressChanged.connect(self._progress_dialog.setValue)
+        self._progress_dialog.canceled.connect(task.cancel)
+        task.taskCompleted.connect(self._progress_dialog.close)
+        task.taskTerminated.connect(self._progress_dialog.close)
+
+        QgsApplication.taskManager().addTask(task)
+        self._progress_dialog.show()
+
+    def _load_layers_info(self, task, connections):
+        """Runs off the main thread. Project layers are cheap and
+        re-read every time; Database layers are queried only once per
+        session and cached after that, so repeat runs feel instant."""
+        proj_layers = get_project_layer_infos()
+        task.progressChanged.emit(10)
+
+        self._layers_info = [li for li in self._layers_info if li.connection_name != 'Проект']
+        self._layers_info = proj_layers + self._layers_info
+        if len(self._layers_info) == len(proj_layers):
+            db_layers = get_db_layer_infos(task, connections)
+            db_layers.sort(key=lambda li: (li.connection_name, li.schema, li.table_name))
+            self._layers_info.extend(db_layers)
+
+        task.progressChanged.emit(100)
+        return True
+
+    def _on_layers_loaded(self, result):
+        self._task = None
+        self._show_target_dialog()
+
+    def _on_layers_load_failed(self, exception):
+        self._task = None
+        self._pending_copy_list = None
+        if 'отмен' not in str(exception).lower():  # not a user-initiated cancel
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                'Копирование объектов',
+                'Не удалось получить список слоёв: {0}'.format(exception),
+            )
+
+    def _show_target_dialog(self):
+        copy_list = self._pending_copy_list
+        self._pending_copy_list = None
+        if copy_list is None:
+            return
+
         distinct_layers = {layer for layer, _ in copy_list}
-        dlg = TargetLayerDialog(self.iface.mainWindow(), len(copy_list), len(distinct_layers))
+        source_geom_types = {
+            QgsWkbTypes.geometryType(feat.geometry().wkbType())
+            for _, feat in copy_list if feat.geometry() and not feat.geometry().isEmpty()
+        }
+
+        dlg = TargetLayerDialog(
+            self.iface.mainWindow(), len(copy_list), len(distinct_layers),
+            self._layers_info, source_geom_types,
+        )
         if dlg.exec_() != QDialog.Accepted:
             return
 
-        target_layer = dlg.selected_layer()
-        if target_layer is None:
+        info = dlg.selected_info()
+        if info is None:
             QMessageBox.warning(self.iface.mainWindow(), 'Копирование объектов', 'Не выбран слой назначения.')
+            return
+
+        target_layer = resolve_layer(info)
+        if target_layer is None:
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                'Копирование объектов',
+                'Не удалось открыть слой «{0}».'.format(info.display_name),
+            )
             return
 
         # Features that happen to already live on the target layer itself
