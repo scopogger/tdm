@@ -349,6 +349,16 @@ class CopyCorrectPlugin:
                 transform_cache[key] = transform
             geom.transform(transform)
 
+        # A source geometry with a Z value can't go into a target column
+        # that doesn't have one -- PostGIS rejects the insert outright
+        # rather than silently flattening it. Same clone -> dropZValue
+        # pattern QGIS's own "Drop Z values" tool uses; the reverse case
+        # (target wants Z, source doesn't have one) isn't handled here.
+        if QgsWkbTypes.hasZ(geom.wkbType()) and not QgsWkbTypes.hasZ(target_layer.wkbType()):
+            flattened = geom.constGet().clone()
+            flattened.dropZValue()
+            geom = QgsGeometry(flattened)
+
         new_feat = QgsFeature(target_fields)
         new_feat.setGeometry(geom)
 
@@ -499,7 +509,18 @@ class CopyCorrectPlugin:
                 if new_val != own_original.get(name):
                     review['carry_over'][name] = new_val
 
-        target_layer.commitChanges()
+        commit_ok = target_layer.commitChanges()
+
+        if accepted and not commit_ok:
+            # QGIS's own error dialog already shows the provider's
+            # detailed message; roll back the failed buffered add so the
+            # layer isn't left half-broken, and stop here rather than
+            # opening more forms on top of a commit that isn't working.
+            target_layer.rollBack()
+            review['stopped_early'] = True
+            review['commit_failed'] = True
+            self._finish_review()
+            return
 
         if accepted:
             review['done'] += 1
@@ -525,7 +546,12 @@ class CopyCorrectPlugin:
             message_lines.append('Пропущено (пустая или несовместимая геометрия): {0}.'.format(review['skipped_geom']))
         if review['skipped_self']:
             message_lines.append('Пропущено (уже на слое назначения): {0}.'.format(review['skipped_self']))
-        if review['stopped_early'] and review['done'] < total:
+        if review.get('commit_failed'):
+            message_lines.append(
+                'Сохранение объекта не удалось — обработка остановлена. '
+                'Подробности см. в окне ошибки от QGIS.'
+            )
+        elif review['stopped_early'] and review['done'] < total:
             message_lines.append('Обработка остановлена пользователем.')
 
         QMessageBox.information(self.iface.mainWindow(), 'Копирование объектов', '\n'.join(message_lines))
