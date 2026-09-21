@@ -252,7 +252,7 @@ def get_db_layer_infos(task, connections):
             QgsMessageLog.logMessage('Ошибка в {0}: {1}'.format(conn['conn_name'], e), 'CopyCorrect', Qgis.Critical)
         finally:
             progress += step
-            task.progressChanged.emit(progress)
+            task.progressChanged.emit(int(progress))
 
     return layers_info
 
